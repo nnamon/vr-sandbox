@@ -1331,7 +1331,7 @@ RUN set -eux \
     && bore --version \
     && interactsh-client -version 2>&1 | grep -q 'Current Version'
 
-COPY sandbox/expose-port /usr/local/bin/expose-port
+COPY expose-port /usr/local/bin/expose-port
 RUN chmod +x /usr/local/bin/expose-port
 
 # ── TLS-SNI tunnel toolkit ───────────────────────────────────────────────────
@@ -1435,6 +1435,6 @@ RUN pip3 install --no-cache-dir \
         pyswf pylzma
 
 # ── Tools reference ──────────────────────────────────────────────────────────
-COPY sandbox/sandbox-tools.txt /tools.txt
+COPY sandbox-tools.txt /tools.txt
 
 WORKDIR /challenge
