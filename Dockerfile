@@ -381,8 +381,11 @@ RUN uv python install 3.12 --install-dir /opt/uv-pythons \
 # - flare-floss/capa : string deobfuscation + capability ID
 # - lief / yara-python / keystone-engine : binary analysis basics
 # - viv-utils / pyelftools : helpers for the above
-# - speakeasy-emulator : Mandiant's PE emulator with full Windows API + CNG
 # - qiling             : multi-arch/multi-OS emulator (Windows PE on aarch64)
+# speakeasy-emulator is intentionally OMITTED from this layer because it pins
+# unicorn==1.0.2, which is incompatible with the unicorn>=2.0 that
+# angr/pwntools need. It gets its own venv at /opt/venvs/speakeasy/
+# further down so unicorn can stay system-wide at the modern version.
 RUN python3 -m pip install --no-cache-dir \
     flare-floss \
     flare-capa \
@@ -391,8 +394,44 @@ RUN python3 -m pip install --no-cache-dir \
     keystone-engine \
     viv-utils \
     pyelftools \
-    speakeasy-emulator \
     qiling
+
+# ── unicorn upgrade (angr-compatible) ─────────────────────────────────────────
+# `unicorn` from apt comes in at 1.0.x but angr's unicorn_engine plugin
+# imports `unicorn.unicorn_py3.*` which only exists in unicorn 2.0+.
+# Without this, `import angr; angr.Project(...)` emits:
+#   ERROR | angr.state_plugins.unicorn_engine | failed loading
+#   "unicornlib.so", unicorn support disabled
+# and symbolic-execution acceleration is silently off. Pin 2.1.2 because
+# pwntools 4.15 explicitly excludes 2.1.3 + 2.1.4. Verified at build time
+# below that angr.Project + pwn.* both still load cleanly.
+RUN python3 -m pip install --no-cache-dir 'unicorn==2.1.2' \
+    && python3 -c "import angr; angr.Project('/bin/ls', auto_load_libs=False)" \
+    && python3 -c "from pwn import *"
+
+# ── speakeasy-emulator (segregated venv to keep system unicorn at 2.x) ───────
+# Mandiant's Windows-PE emulator pins unicorn==1.0.2, which would clash with
+# the system upgrade above. Install into its own venv so callers can opt in
+# via `/opt/venvs/speakeasy/bin/python -c "import speakeasy; ..."` without
+# breaking the main angr/pwntools toolchain. The CLI is wrapped so
+# `speakeasy --help` continues to work from $PATH.
+RUN python3 -m venv /opt/venvs/speakeasy \
+    && /opt/venvs/speakeasy/bin/pip install --no-cache-dir \
+        speakeasy-emulator pefile \
+    && ln -sf /opt/venvs/speakeasy/bin/speakeasy /usr/local/bin/speakeasy \
+    || echo "speakeasy venv install failed (non-fatal — angr/pwntools still work)"
+
+# ── Defense / RE Python additions (game RE, wasm execution) ──────────────────
+# - wasmtime : Bytecode Alliance reference WASM runtime (Python bindings).
+#   Pairs with wabt (wasm2wat/wat2wasm — already installed via apt) so we
+#   can both inspect AND execute .wasm modules. wasmer was tried but has
+#   no arm64 wheels at install time and refuses to load on aarch64.
+# - UnityPy  : Unity asset / il2cpp metadata extraction. Standard library
+#   for cracking Unity game distfiles (extracts shaders, scripts, assets
+#   from .unity3d / GameAssembly bundles).
+RUN python3 -m pip install --no-cache-dir \
+    wasmtime \
+    UnityPy
 
 # ── qemu-user-static (foreign-arch Linux ELFs) ───────────────────────────────
 # Lets the agent execute non-host-arch Linux binaries directly: router
@@ -405,6 +444,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-user-static binfmt-support \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/qemu-i386-static /usr/local/bin/qemu-i386 \
+    && ln -sf /usr/bin/qemu-x86_64-static /usr/local/bin/qemu-x86_64 \
     && ln -sf /usr/bin/qemu-arm-static /usr/local/bin/qemu-arm \
     && ln -sf /usr/bin/qemu-aarch64-static /usr/local/bin/qemu-aarch64 \
     && ln -sf /usr/bin/qemu-mips-static /usr/local/bin/qemu-mips \
@@ -413,6 +453,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/qemu-riscv64-static /usr/local/bin/qemu-riscv64 \
     && ln -sf /usr/bin/qemu-ppc-static /usr/local/bin/qemu-ppc \
     && ln -sf /usr/bin/qemu-ppc64-static /usr/local/bin/qemu-ppc64
+
+# ── qemu-system-* (nested full-system emulation for kernel-pwn challenges) ──
+# Some CTF tracks (DEF CON Quals coalmine-style: bzImage + initramfs.cpio +
+# vmlinux + nsjail) ship a runnable Linux kernel image and expect the
+# attacker to boot it locally to develop the exploit. qemu-system-x86_64
+# + qemu-system-arm + qemu-system-aarch64 cover both common host arches
+# (kernel built for aarch64 vs x86_64) and the bring-up recipe is:
+#   qemu-system-x86_64 -m 256M -nographic -kernel bzImage \
+#     -initrd initramfs.cpio -append "console=ttyS0 nokaslr"
+# No KVM is exposed inside the sandbox (no /dev/kvm), so this is TCG/JIT
+# emulation only — slower but works on every host without escalation.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        qemu-system-x86 qemu-system-arm qemu-system-misc \
+        qemu-utils \
+    && rm -rf /var/lib/apt/lists/*
 
 # ── i386 sysroot (so qemu-i386-static can run dynamically-linked i386 ELFs) ──
 # Most CTF i386 binaries (pwnable.tw, picoCTF, ROP wargames) are dynamically
@@ -503,6 +558,9 @@ RUN echo "wireshark-common wireshark-common/install-setuid boolean false" \
         mosquitto-clients \
         # WebAssembly toolkit (wasm2wat / wat2wasm / wasm-decompile / wasm-objdump)
         wabt \
+        # Extended-attribute inspection (getfattr/setfattr) — needed by FUSE
+        # filesystem challenges, file-capabilities checks, ACL-tagged distfiles
+        attr \
         # JPEG steganography (complements zsteg for PNG/BMP)
         outguess \
         # Protobuf compiler/decoder (binary blob inspection)

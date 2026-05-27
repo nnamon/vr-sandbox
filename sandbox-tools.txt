@@ -554,7 +554,24 @@ flare-floss        Obfuscated-string deobfuscator. floss binary
 flare-capa         Capability identifier. capa binary
 yara-python        from yara import compile  (yara CLI also installed).
 qiling             Multi-arch/multi-OS emulator (Windows PE on aarch64).
-speakeasy-emulator PE emulator with full Windows API + CNG.
+speakeasy-emulator PE emulator with full Windows API + CNG. Installed in a
+                   segregated venv at /opt/venvs/speakeasy/ because it
+                   pins unicorn==1.0.2 (incompatible with the system
+                   unicorn 2.x angr/pwntools need). Invoke as:
+                     /opt/venvs/speakeasy/bin/python -c "import speakeasy; ..."
+                   The CLI is also wrapped at /usr/local/bin/speakeasy.
+wasmtime           WASM runtime (Python bindings). Pair with wabt (apt:
+                   wasm2wat/wat2wasm/wasm-objdump) — wabt inspects /
+                   converts, wasmtime executes. Smallest invocation:
+                     import wasmtime
+                     eng = wasmtime.Engine()
+                     mod = wasmtime.Module(eng, open('m.wasm','rb').read())
+                     store = wasmtime.Store(eng)
+                     inst = wasmtime.Instance(store, mod, [])
+                     print(inst.exports(store)['add'](store, 1, 2))
+UnityPy            Unity asset / il2cpp metadata extractor for game RE.
+                   import UnityPy; env = UnityPy.load('GameAssembly.so');
+                   for obj in env.objects: ...
 frida (Python)     Dynamic instrumentation. import frida (CLI also installed).
 scapy              See NETWORK FORENSICS.
 mitmproxy          See WEB PENTESTING (also a Python lib for addons).
@@ -638,6 +655,20 @@ wine / wine64      Run Windows PE binaries. wine64 file.exe (x86_64 PE),
                    installed) — for those, prefer static analysis (Ghidra,
                    capa, floss) or rebuild the sandbox with --platform
                    linux/amd64.
+qemu-system-*      Full-system emulation for kernel images. Boot a Linux
+                   kernel locally (kernel-pwn challenges shipping bzImage
+                   + initramfs.cpio + vmlinux). No KVM is exposed inside
+                   the sandbox, so this is pure TCG/JIT — slower than
+                   native but works on every host without escalation.
+                   Bring-up recipe:
+                     qemu-system-x86_64 -m 256M -nographic \
+                       -kernel bzImage -initrd initramfs.cpio \
+                       -append "console=ttyS0 nokaslr"
+                   For aarch64 kernels: qemu-system-aarch64 with
+                   -M virt -cpu cortex-a72.
+                   Pair with qemu-img for disk-image inspection
+                   (convert, resize, info) when challenges ship raw or
+                   qcow2 images.
 
 == CALLBACK / TUNNELS ==
 For SSRF, blind XSS, OAuth callbacks, reverse shells, OOB exfil, etc.
