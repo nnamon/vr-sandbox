@@ -1,28 +1,15 @@
-CTF SANDBOX TOOLS REFERENCE
-============================
-All tools pre-installed in the sandbox. cat /tools.txt to view this file.
-
-== FIRST-TURN ORIENTATION ==
-Before forming hypotheses, walk the distfile end-to-end. For every
-file in /challenge/distfiles/:
-  - Run `file <path>` to identify the format (do not infer from extension).
-  - Unpack archives (zip/tar/7z) into /challenge/workspace/ and recurse —
-    Dockerfile / run.sh / Makefile / docker-compose.yml inside a service
-    bundle answer questions about how the remote is actually run.
-  - `cat` any small text artifacts (Dockerfile, run.sh, *.md, *.txt,
-    *.py source) verbatim before reasoning about behaviour.
+SANDBOX TOOLS REFERENCE
+========================
+All tools pre-installed in the vr-sandbox image. `cat /tools.txt` to view
+this file from inside a running container. Consumer applications (the
+ctf-agent runtime, an interactive shell, etc.) may inject additional
+domain-specific orientation files alongside this one — read those too if
+present.
 
 `uname -m` inside this sandbox reports the SANDBOX's arch, which is the
 docker host's arch (often aarch64 on macOS, x86_64 on Linux). It tells
-you nothing about the challenge target. To determine the target arch,
-read `file <binary>` on the actual challenge binary and any Dockerfile
-in the distfile. For pwn challenges using `pwn.red/jail:<ver>` (visible
-in the Dockerfile), the remote is x86_64; the supplied libc.so.6 +
-ld-linux-*.so.* in the distfile ARE the remote loader and libc — use
-their offsets directly. To exploit-dev under remote-faithful ASLR,
-run the supplied jail under emulation locally:
-  docker run --rm -i --platform linux/amd64 -v $PWD/bin:/srv/app \
-    pwn.red/jail:<ver> sh -lc 'jail /srv/app/run'
+you nothing about a downstream target's arch — always check the actual
+binary with `file <path>`.
 
 == NETWORKING ==
 nc (netcat)        TCP/UDP connections. nc host port <<'EOF' for heredoc sessions.
@@ -49,9 +36,11 @@ socat              Generic stream forwarder. TLS-SNI tunnel:
                    socat TCP-LISTEN:3000,fork,reuseaddr \
                          OPENSSL:host:443,sni=host,verify=0
                    then `nc localhost 3000` to reach the wrapped TCP target.
-sc (snicat)        CTFd TLS-SNI tunnel helper. sc -b 3000 <sni-host> binds
-                   127.0.0.1:3000 and proxies to the SNI'd backend. Use for
-                   bts.wh.edu.pl-style TLS-wrapped TCP challenges.
+sc (snicat)        TLS-SNI tunnel helper. sc -b 3000 <sni-host> binds
+                   127.0.0.1:3000 and proxies to the SNI'd backend. Use
+                   for any TCP target reachable only behind a CNAME-routed
+                   SNI front (originally added for bts.wh.edu.pl-style
+                   TLS-wrapped TCP challenges).
 
 == WEB PENTESTING ==
 ffuf               Fast web fuzzer. ffuf -u http://t/FUZZ -w /opt/wordlists/common.txt
@@ -205,7 +194,7 @@ pyinstxtractor-ng  Extract a PyInstaller-packed exe back to .pyc + assets.
                    python3 -m pyinstxtractor app.exe   (output in app.exe_extracted/)
 
 == PWN / EXPLOITATION ==
-pwntools           CTF exploit framework. from pwn import *
+pwntools           Exploit framework (binary RE / pwn). from pwn import *
                    p64/p32, ROP, shellcraft, asm, remote()/process().
 gdb                GNU debugger; pwndbg loaded by default at /opt/pwndbg.
                    Common: gdb ./binary -ex 'b main' -ex r
@@ -294,7 +283,7 @@ tshark             Wireshark CLI. tshark -r file.pcap -Y 'http.request' -T field
                      -e ip.src -e http.host -e http.request.uri
                    Decryption (TLS): tshark -r f.pcap -o tls.keylog_file:keys.log
 tcpdump            Packet capture / filter. tcpdump -r file.pcap 'tcp port 80'
-ngrep              grep over packet payloads. ngrep -I file.pcap 'flag{'
+ngrep              grep over packet payloads. ngrep -I file.pcap 'pattern'
 scapy              Python packet crafting/parsing. from scapy.all import *
                      pkts = rdpcap('f.pcap'); pkts[0].summary()
 
@@ -397,7 +386,6 @@ az (azure-cli)     Azure CLI. az login, az account list, az vm list.
                    -p <secret> --tenant <tenant>.
 kubectl            Kubernetes CLI. kubectl get pods, kubectl exec -it pod -- sh.
                    Config via KUBECONFIG=/path/to/config or ~/.kube/config.
-                   For CTF k8s challenges, kubeconfig is usually given.
 cloudfox           Multi-cloud enumeration (BishopFox).
                    cloudfox aws all-checks --profile default.
 prowler            AWS / Azure / GCP audit framework.
@@ -542,7 +530,7 @@ podman-compose     Docker Compose compatible. podman-compose up -d
 buildah            Build OCI container images. buildah bud -t myimage .
 
 == PYTHON 3 LIBRARIES ==
-pwntools           CTF exploit framework. from pwn import *
+pwntools           Exploit framework (binary RE / pwn). from pwn import *
                    p64/p32 packing, remote/process, ROP, shellcraft, asm.
 pycryptodome       Crypto primitives. from Crypto.Cipher import AES
 sympy              Symbolic math. factorint(n), isprime(n), discrete_log, nthroot_mod.
@@ -712,8 +700,9 @@ pymysql            Python lib (pre-installed). `import pymysql`.
 
 == ML / AI ==
 ML stack pre-installed: jax, flax, einops, numpy, scipy.
-Use for memorization-extraction style challenges (find a prompt prefix
-that makes greedy decode emit the flag).
+Useful for model-extraction, memorization-recovery, and prompt-construction
+research (e.g. finding inputs that drive greedy decode toward a chosen
+output sequence).
 
 == MINECRAFT / GAME PROTOCOLS ==
 mcstatus           Probe Minecraft server status. `mcstatus HOST status`.
@@ -725,8 +714,9 @@ quarry             Python Minecraft protocol lib. `import quarry`.
   Static analysis (Ghidra, radare2, capa, floss, angr) remains the right
   starting point for non-trivial RE; dynamic analysis is a complement.
 - Need a package not listed? Run `pip install <pkg>` or `uv pip install <pkg>`.
-- Distfiles are at /challenge/distfiles/ (read-only)
-- Write generated/repaired files to /challenge/workspace/ (writable)
+- The image makes no assumption about where you mount the work tree;
+  consumers (ctf-agent, interactive shells, etc.) typically bind a
+  workspace dir at /work or /challenge and chdir there before running.
 - Services on the host are reachable via host.docker.internal (bridge networking).
 - RsaCtfTool is at /opt/RsaCtfTool/
 - CADO-NFS is at /opt/cado-nfs/
