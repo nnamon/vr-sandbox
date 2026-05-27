@@ -1,0 +1,1440 @@
+# vr-sandbox: vulnerability-research sandbox image.
+#
+# General-purpose container for offensive-security work — binary
+# reverse engineering, web pentesting, crypto analysis, cloud-side
+# investigation, forensic carving, and CTF-style challenge solving.
+# The toolchain leans broad rather than narrow so a research session
+# doesn't get blocked installing tools mid-flight.
+#
+# Most users should pull the pre-built multi-arch image instead of
+# building locally — it's ~30 min to build, ~8 GB compressed:
+#
+#   docker pull nnamon/vr-sandbox:latest
+#   docker tag nnamon/vr-sandbox:latest vr-sandbox
+#
+# Local build (only if you've modified this file):
+#
+#   docker build -f Dockerfile -t vr-sandbox .
+#
+# CI auto-publishes a multi-arch (amd64 + arm64) image to Docker Hub
+# on every push to main via .github/workflows/build.yml.
+#
+# Notes for consumer applications:
+#   - The image has no opinion about where the work mounts. Consumers
+#     typically bind a workspace dir at /work or /challenge and chdir
+#     there before running tools. The `nnamon/ctf-agent` codebase that
+#     originated this image uses /challenge/workspace/ — that path
+#     isn't baked in; it's just the convention that consumer settled on.
+#   - Inline comments referencing specific past CTF events (pwnable.tw,
+#     picoCTF, kctf, etc.) are kept as factual provenance for WHY a
+#     particular glibc version / tool / workaround exists — they're
+#     not CTF-coupling.
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TERM=xterm
+
+# ── System packages ───────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    # Networking
+    netcat-openbsd curl wget nmap \
+    # SSH client + non-interactive password auth (pwnable.kr challenges
+    # all use `ssh user@pwnable.kr -p2222` with password `guest`)
+    openssh-client sshpass \
+    # Binary analysis
+    binutils file xxd bsdmainutils binwalk \
+    # binutils-multiarch — one_gadget on amd64 binaries fails without it
+    # ("Objdump that supports architecture amd64 is not found"). The
+    # default `binutils` only contains the host-arch backend; the multi-
+    # arch package adds objdump backends for x86_64 / arm / mips / ppc.
+    binutils-multiarch \
+    # cpio — initramfs unpack/repack for kernel-pwn challenges
+    cpio \
+    gdb ltrace strace \
+    # Forensics / steg / image analysis
+    exiftool steghide \
+    pngcheck imagemagick \
+    # Filesystem forensics
+    xfsprogs sleuthkit foremost dcfldd testdisk \
+    # Audio / media
+    ffmpeg sox \
+    # OCR
+    tesseract-ocr tesseract-ocr-eng \
+    # Crypto / encoding
+    openssl libssl-dev \
+    # Build tools
+    gcc g++ make cmake \
+    # Python (system base)
+    python3 python3-pip python3-dev \
+    # Ruby (for zsteg)
+    ruby ruby-dev \
+    # Java (full JDK for jar/javap/javac, also Ghidra headless)
+    default-jdk-headless \
+    # JS runtime (web challenges, audit of JS source)
+    nodejs npm \
+    # Web pentesting
+    sqlmap \
+    # SQLite (DB forensics, practice)
+    sqlite3 \
+    # Misc
+    git jq zip unzip ca-certificates ncurses-term \
+    # Archive / installer unpackers (p7zip handles 7z/zip/xz/gz/cab and
+    # often rar; the others cover formats it doesn't). innoextract is
+    # NOT in jammy/arm64 — installer-extraction relies on 7z fallback.
+    p7zip-full cabextract unrar \
+    # DNS / whois recon (web/forensics challenges)
+    dnsutils whois \
+    # Cross-arch debugging (ARM/MIPS/PPC pwnables under qemu-user)
+    gdb-multiarch \
+    # PARI/GP (number-theory CLI, complements sage for some crypto)
+    pari-gp \
+    # Math libs (required by flatter, cado-nfs, fpylll, and gmpy2's
+    # source build path on arm64 where pip can't find a prebuilt wheel
+    # for RsaCtfTool's pinned gmpy2 — without libmpc-dev the build
+    # fails with "fatal error: mpc.h: No such file or directory").
+    libgmp-dev libmpfr-dev libmpc-dev libfplll-dev libeigen3-dev \
+    # z3 solver system lib
+    libz3-dev \
+    # CADO-NFS build deps
+    libhwloc-dev libbz2-dev \
+    # General tooling the agent reaches for by default — empirically the
+    # most-attempted missing binaries across the trace logs.
+    ripgrep \
+    nasm \
+    llvm lld \
+    python-is-python3 \
+    # Interactive scripting (some pwn challenges drive a remote tty).
+    expect \
+    # Build deps for r2dec (r2pm-installed below) — meson + ninja.
+    ninja-build meson \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── SageMath 10 (via micromamba + conda-forge) ────────────────────────────────
+# Ubuntu apt only ships SageMath 9.5 (Jan 2022) on both 22.04 jammy and
+# 24.04 noble — too old for most modern crypto APIs the solver reaches
+# for. Specifically missing in 9.5 and added in later versions:
+#
+#   - EllipticCurve.montgomery_model()          (Sage 9.8)
+#   - sage.rings.generic.ProductTree            (Sage 10.x)
+#   - EllipticCurveHom_velusqrt (fast Vélu)     (Sage 9.6)
+#   - GaussianField direct import path          (Sage 10.x)
+#
+# So we install Sage 10 from conda-forge into /opt/sage10 via micromamba
+# (a single-binary static-built conda). The conda env brings its own
+# Python and pulls maxima/gap/singular/pari-gp/flint as deps. The crypto
+# libs the solver reaches for from inside Sage (pycryptodome / gmpy2 /
+# sympy / fpylll / cypari2) get installed into the same env so that
+# `sage script.sage` and `sage -c '...'` see them.
+#
+# The system python3 (3.10) still has its own copy of these libs
+# (installed below) for non-sage scripts.
+#
+# Image-size cost: ~3 GB. Build-time cost: ~5 min download from
+# conda-forge channels (no source compile).
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) MM_PKG=linux-64 ;; \
+         arm64) MM_PKG=linux-aarch64 ;; \
+         *) echo "unsupported arch $ARCH"; exit 1 ;; \
+       esac \
+    && mkdir -p /opt/micromamba/bin \
+    && curl -fsSL "https://micro.mamba.pm/api/micromamba/$MM_PKG/latest" \
+       | tar -xj -C /opt/micromamba/bin --strip-components=1 bin/micromamba \
+    && export MAMBA_ROOT_PREFIX=/opt/micromamba \
+    && /opt/micromamba/bin/micromamba create -y -p /opt/sage10 \
+         -c conda-forge \
+         sage \
+         pycryptodome gmpy2 sympy fpylll cypari2 \
+    && ln -sf /opt/sage10/bin/sage /usr/local/bin/sage \
+    && /opt/micromamba/bin/micromamba clean --all --yes
+
+# ── Podman (nested containers — run challenge Docker images inside sandbox) ───
+# Ubuntu 22.04 needs the kubic repo for podman
+RUN apt-get update && apt-get install -y curl gnupg2 \
+    && . /etc/os-release \
+    && echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" \
+       > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list \
+    && curl -fsSL "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/Release.key" \
+       | gpg --dearmor -o /etc/apt/trusted.gpg.d/kubic.gpg \
+    && apt-get update && apt-get install -y podman buildah fuse-overlayfs slirp4netns \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "Podman install failed (non-fatal) — nested containers will not be available"
+
+# ── radare2 ───────────────────────────────────────────────────────────────────
+RUN git clone --depth=1 https://github.com/radareorg/radare2 /tmp/r2 \
+    && cd /tmp/r2 && bash sys/install.sh --install \
+    && ldconfig \
+    && r2 -v \
+    && rm -rf /tmp/r2
+
+# ── r2ghidra (Ghidra decompiler integrated into radare2) ────────────────────
+# Lets `pdg` inside r2 (or `r2 -qc 'pdg' ./binary`) emit Ghidra-quality
+# decompilation without exiting r2. Solvers reach for this 9+ times in the
+# logs; without it, `pdg` silently falls back to the much less useful
+# ghidra-less default. Build via r2pm so it tracks the installed r2 ABI.
+RUN r2pm -U \
+    && r2pm -ci r2ghidra \
+    || echo "r2ghidra install failed (non-fatal — r2 native pdc still works)"
+
+# ── r2dec (JS-based r2 decompiler — distinct from r2ghidra) ─────────────────
+# Provides `pdd` / `pdc` commands, which the LLM frequently reaches for
+# alongside `pdg` (r2ghidra). HTB MCP TryOut traces showed 8 separate
+# "You need to install the plugin with r2pm -ci r2dec" prompts on
+# router-web alone. Cheap to add (depends only on meson + ninja from
+# the apt block above).
+RUN r2pm -ci r2dec \
+    || echo "r2dec install failed (non-fatal — r2ghidra's pdg still works)"
+
+# ── flatter (fast lattice reduction — Keegan Ryan's fork) ────────────────────
+RUN git clone --depth=1 https://github.com/keeganryan/flatter /tmp/flatter \
+    && cmake -S /tmp/flatter -B /tmp/flatter/build \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/flatter/build -j$(nproc) \
+    && cmake --install /tmp/flatter/build \
+    && ldconfig \
+    && rm -rf /tmp/flatter
+
+# ── uv (fast Python package manager) ─────────────────────────────────────────
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:/root/.local/bin:$PATH"
+
+# ── Ruby gems: zsteg + seccomp-tools + evil-winrm ───────────────────────
+# zsteg/seccomp-tools cover PNG steg + syscall-filter dumps;
+# evil-winrm provides PowerShell-over-WinRM. (cewl is NOT a published gem
+# despite folklore; installed via apt instead, see system-packages block.)
+RUN gem install zsteg seccomp-tools evil-winrm
+
+# ── stegseek (build from source — pre-built .deb is amd64 only) ──────────────
+RUN apt-get update && apt-get install -y libmhash-dev libmcrypt-dev libjpeg-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth=1 https://github.com/RickdeJager/stegseek /tmp/stegseek \
+    && cmake -S /tmp/stegseek -B /tmp/stegseek/build \
+    && cmake --build /tmp/stegseek/build --target install \
+    && rm -rf /tmp/stegseek
+
+# ── Python CTF libraries (system python3) ────────────────────────────────────
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+RUN pip3 install --no-cache-dir \
+    pwntools \
+    pycryptodome \
+    sympy \
+    gmpy2 \
+    requests \
+    Pillow \
+    z3-solver \
+    ortools \
+    pytesseract \
+    scipy \
+    numpy \
+    angr \
+    capstone \
+    unicorn \
+    ropgadget \
+    tqdm \
+    fpylll \
+    flask \
+    volatility3 \
+    PyJWT \
+    pyghidra \
+    semgrep \
+    # r2 driver — let solvers script radare2 from Python instead of
+    # subprocess-shelling. Caught 23 ImportErrors across the MCP TryOut.
+    r2pipe \
+    # PDF parsing for forensics. Five overlapping libs because the
+    # solver doesn't know which is installed and we'd rather be safe.
+    pypdf PyPDF2 pdfplumber pdfminer.six PyMuPDF \
+    # Image processing for stego / image-bound challenges. Headless
+    # variant of opencv (~50MB vs ~150MB; no GUI bindings we'd never
+    # use anyway).
+    opencv-python-headless \
+    imageio \
+    # MySQL client for web/db challenges.
+    pymysql
+
+# ── PyTorch (CPU-only) + Keras ────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir --ignore-installed sympy \
+    torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip3 install --no-cache-dir keras
+
+# ── RsaCtfTool (catch-all automated RSA/factoring attacks) ────────────────────
+RUN git clone --depth=1 https://github.com/RsaCtfTool/RsaCtfTool /opt/RsaCtfTool \
+    && pip3 install --no-cache-dir /opt/RsaCtfTool
+
+# ── CADO-NFS (Number Field Sieve — large integer factoring + DLP) ─────────────
+RUN git clone --depth=1 https://gitlab.inria.fr/cado-nfs/cado-nfs.git /opt/cado-nfs \
+    && cd /opt/cado-nfs && make -j$(nproc)
+RUN printf '#!/bin/bash\n\
+BUILD_PARENT=/opt/cado-nfs/build\n\
+H=$(hostname)\n\
+if [ ! -d "$BUILD_PARENT/$H" ]; then\n\
+  src=$(ls -d "$BUILD_PARENT"/* 2>/dev/null | head -1)\n\
+  [ -n "$src" ] && ln -sf "$src" "$BUILD_PARENT/$H"\n\
+fi\n\
+exec python3 /opt/cado-nfs/cado-nfs.py "$@"\n' > /usr/local/bin/cado-nfs \
+    && chmod +x /usr/local/bin/cado-nfs
+
+# ── ffuf (content / parameter / vhost fuzzer) ────────────────────────────────
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in arm64) FFUF_ARCH=arm64 ;; amd64) FFUF_ARCH=amd64 ;; *) FFUF_ARCH=amd64 ;; esac \
+    && curl -sSL "https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_${FFUF_ARCH}.tar.gz" \
+       -o /tmp/ffuf.tgz \
+    && tar -xzf /tmp/ffuf.tgz -C /usr/local/bin ffuf \
+    && rm /tmp/ffuf.tgz \
+    && ffuf -V | head -1
+
+# ── Additional JDKs (Adoptium Temurin tarballs) ─────────────────────────────
+# jammy/arm64 only ships openjdk-11 in apt; we add 17 and 21 as side-installs
+# at /opt/jdk-NN/ so build tools that need a newer JDK (e.g. Fernflower
+# requires 21+ for source-release 21) can point JAVA_HOME at them without
+# disturbing the system default. Download URLs use Adoptium's "latest" API
+# so this stays current as Temurin ships LTS updates.
+RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/aarch64/') \
+    && for v in 17 21; do \
+         mkdir -p /opt/jdk-${v} \
+         && curl -fsSL "https://api.adoptium.net/v3/binary/latest/${v}/ga/linux/${ARCH}/jdk/hotspot/normal/eclipse?project=jdk" \
+              -o /tmp/jdk-${v}.tar.gz \
+         && tar -xzf /tmp/jdk-${v}.tar.gz -C /opt/jdk-${v} --strip-components=1 \
+         && rm /tmp/jdk-${v}.tar.gz \
+         && /opt/jdk-${v}/bin/java -version \
+         || echo "JDK ${v} tarball install failed (non-fatal — JDK 11 still default)"; \
+       done
+
+# ── jadx (Java/APK decompiler) ────────────────────────────────────────────────
+RUN curl -sSL "https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip" \
+       -o /tmp/jadx.zip \
+    && mkdir -p /opt/jadx \
+    && unzip -q /tmp/jadx.zip -d /opt/jadx \
+    && rm /tmp/jadx.zip \
+    && ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx \
+    && ln -s /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui
+
+# ── CFR (Java decompiler — handles obfuscated bytecode jadx mangles) ─────────
+# Single-jar drop-in. Wrapper at /usr/local/bin/cfr lets the agent invoke it
+# the same way as jadx: `cfr foo.jar > out.java`.
+RUN curl -fsSL "https://www.benf.org/other/cfr/cfr-0.152.jar" -o /opt/cfr.jar \
+    && printf '#!/bin/bash\nexec java -jar /opt/cfr.jar "$@"\n' > /usr/local/bin/cfr \
+    && chmod +x /usr/local/bin/cfr \
+    || echo "cfr download failed (non-fatal — jadx still works)"
+
+# ── Procyon (older Java decompiler — fourth fallback for tricky cases) ──────
+RUN curl -fsSL "https://github.com/mstrobel/procyon/releases/download/v0.6.0/procyon-decompiler-0.6.0.jar" \
+       -o /opt/procyon.jar \
+    && printf '#!/bin/bash\nexec java -jar /opt/procyon.jar "$@"\n' > /usr/local/bin/procyon \
+    && chmod +x /usr/local/bin/procyon \
+    || echo "procyon download failed (non-fatal — jadx + cfr + fernflower still cover most cases)"
+
+# ── Fernflower (JetBrains' decompiler — strong on lambdas + modern Java) ─────
+# No pre-built jar release; build from the fesh0r mirror via gradle (~25s).
+# fesh0r's tip targets `source-release: 21`, so the build itself needs
+# JDK 21 (we install it at /opt/jdk-21 above). Runtime can use any JDK 17+
+# but we point the wrapper at JDK 21 for parity with the build environment.
+RUN git clone --depth=1 https://github.com/fesh0r/fernflower /tmp/fernflower \
+    && cd /tmp/fernflower \
+    && JAVA_HOME=/opt/jdk-21 ./gradlew --no-daemon build \
+    && mkdir -p /opt/fernflower \
+    && cp build/libs/fernflower.jar /opt/fernflower/ \
+    && cd / && rm -rf /tmp/fernflower /root/.gradle \
+    && printf '#!/bin/bash\nexec /opt/jdk-21/bin/java -jar /opt/fernflower/fernflower.jar "$@"\n' \
+       > /usr/local/bin/fernflower \
+    && chmod +x /usr/local/bin/fernflower \
+    || echo "fernflower build failed (non-fatal — jadx + cfr + procyon still cover most cases)"
+
+# ── Wordlists (small subset of SecLists for ffuf/dirbusting) ──────────────────
+RUN mkdir -p /opt/wordlists \
+    && curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt \
+        -o /opt/wordlists/common.txt \
+    && curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt \
+        -o /opt/wordlists/raft-medium-directories.txt \
+    && curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-files.txt \
+        -o /opt/wordlists/raft-medium-files.txt \
+    && curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/quickhits.txt \
+        -o /opt/wordlists/quickhits.txt \
+    && curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/10-million-password-list-top-10000.txt \
+        -o /opt/wordlists/passwords-top10k.txt
+
+# ── Python 3.12 + trailmark (Trail of Bits' code-graph analyzer) ──────────────
+# trailmark requires Python 3.12+, but the rest of the sandbox is on the
+# system Python 3.10. Install 3.12 via uv (already installed earlier) —
+# it pulls a pre-built CPython tarball from python-build-standalone in
+# ~30s with no PPA / Launchpad dependency, which has been the historical
+# pain point (deadsnakes PPA goes down periodically and tanks the whole
+# build).
+# /opt/python3.12 holds the standalone interpreter; symlink to
+# /usr/local/bin/python3.12 so existing references still work.
+# uv-installed CPython is PEP 668 marked (externally-managed-environment),
+# so `python3.12 -m pip install ...` refuses without --break-system-packages.
+# Skip the broken-via-pip path and use `uv tool install` instead — it
+# creates an isolated venv under /root/.local/share/uv/tools and shims
+# `trailmark` onto PATH automatically. python3.12 itself is still
+# accessible at /usr/local/bin/python3.12 for ad-hoc scripts; for
+# trailmark API usage do `uv run --python 3.12 python -c 'import trailmark; ...'`.
+RUN uv python install 3.12 --install-dir /opt/uv-pythons \
+    && PY312=$(uv python find 3.12) \
+    && ln -sf "$PY312" /usr/local/bin/python3.12 \
+    && uv tool install --python 3.12 trailmark \
+    || echo "python3.12/trailmark install failed (non-fatal)"
+
+# ── FLARE malware-RE toolkit + Windows-PE emulators ─────────────────────────
+# Use python3.10 explicitly (system pip3 was rebound to python3.12 by the
+# trailmark layer above; pip3 alone would install to the wrong interpreter).
+# - flare-floss/capa : string deobfuscation + capability ID
+# - lief / yara-python / keystone-engine : binary analysis basics
+# - viv-utils / pyelftools : helpers for the above
+# - speakeasy-emulator : Mandiant's PE emulator with full Windows API + CNG
+# - qiling             : multi-arch/multi-OS emulator (Windows PE on aarch64)
+RUN python3 -m pip install --no-cache-dir \
+    flare-floss \
+    flare-capa \
+    lief \
+    yara-python \
+    keystone-engine \
+    viv-utils \
+    pyelftools \
+    speakeasy-emulator \
+    qiling
+
+# ── qemu-user-static (foreign-arch Linux ELFs) ───────────────────────────────
+# Lets the agent execute non-host-arch Linux binaries directly: router
+# firmware (MIPS/ARM), embedded crackmes, exotic-arch malware samples.
+# Explicit invocation always works: `qemu-mips64-static ./binary`.
+# Auto-dispatch via binfmt_misc additionally lets `./binary` Just Work when
+# the host kernel has handlers registered (Docker Desktop usually does this
+# automatically); explicit form is the reliable fallback when it doesn't.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        qemu-user-static binfmt-support \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/qemu-i386-static /usr/local/bin/qemu-i386 \
+    && ln -sf /usr/bin/qemu-arm-static /usr/local/bin/qemu-arm \
+    && ln -sf /usr/bin/qemu-aarch64-static /usr/local/bin/qemu-aarch64 \
+    && ln -sf /usr/bin/qemu-mips-static /usr/local/bin/qemu-mips \
+    && ln -sf /usr/bin/qemu-mipsel-static /usr/local/bin/qemu-mipsel \
+    && ln -sf /usr/bin/qemu-mips64-static /usr/local/bin/qemu-mips64 \
+    && ln -sf /usr/bin/qemu-riscv64-static /usr/local/bin/qemu-riscv64 \
+    && ln -sf /usr/bin/qemu-ppc-static /usr/local/bin/qemu-ppc \
+    && ln -sf /usr/bin/qemu-ppc64-static /usr/local/bin/qemu-ppc64
+
+# ── i386 sysroot (so qemu-i386-static can run dynamically-linked i386 ELFs) ──
+# Most CTF i386 binaries (pwnable.tw, picoCTF, ROP wargames) are dynamically
+# linked: they need /lib/ld-linux.so.2 + libc.so.6 to start. On an aarch64
+# sandbox we have qemu-i386-static but NOT the i386 root, so even
+# `qemu-i386-static ./binary` fails with "/lib/ld-linux.so.2: no such file".
+# We also can't `dpkg --add-architecture i386` on arm64 hosts (no peer
+# repo). So fetch the libc6-i386 .deb directly from archive.ubuntu.com,
+# extract to /opt/i386-sysroot, and point QEMU_LD_PREFIX at it. This makes
+# `qemu-i386-static ./binary` Just Work — the operator/agent doesn't need
+# to remember the -L flag. Per-challenge libcs (e.g. pwnable.tw's
+# libc_32.so.6) still take precedence when they sit alongside the binary.
+RUN mkdir -p /opt/i386-sysroot \
+    && cd /tmp \
+    && for pkg in \
+         "g/glibc/libc6_2.35-0ubuntu3.10_i386.deb" \
+         "g/gcc-12/libstdc++6_12.3.0-1ubuntu1~22.04_i386.deb" \
+         "g/gcc-12/libgcc-s1_12.3.0-1ubuntu1~22.04_i386.deb" \
+         "z/zlib/zlib1g_1.2.11.dfsg-2ubuntu9.2_i386.deb" \
+         "n/ncurses/libtinfo6_6.3-2ubuntu0.1_i386.deb" \
+         "n/ncurses/libncurses6_6.3-2ubuntu0.1_i386.deb"; do \
+       fname=$(basename "$pkg"); \
+       url="http://archive.ubuntu.com/ubuntu/pool/main/$pkg"; \
+       (curl -fsSL "$url" -o "/tmp/$fname" \
+          && dpkg-deb -x "/tmp/$fname" /opt/i386-sysroot \
+          && rm "/tmp/$fname") \
+         || echo "i386 sysroot: $pkg failed (non-fatal — version drift?)"; \
+     done \
+    # Provide /lib/ld-linux.so.2 at the canonical path so naked `./binary`
+    # invocations through binfmt_misc (when the host kernel registers
+    # qemu-i386) also resolve their interpreter.
+    && if [ -f /opt/i386-sysroot/lib/ld-linux.so.2 ]; then \
+         ln -sf /opt/i386-sysroot/lib/ld-linux.so.2 /lib/ld-linux.so.2; \
+       elif [ -f /opt/i386-sysroot/lib/i386-linux-gnu/ld-linux.so.2 ]; then \
+         ln -sf /opt/i386-sysroot/lib/i386-linux-gnu/ld-linux.so.2 /lib/ld-linux.so.2; \
+       fi \
+    && ls -la /opt/i386-sysroot/lib/i386-linux-gnu/ /lib/ld-linux.so.2 2>&1 | head -10
+ENV QEMU_LD_PREFIX=/opt/i386-sysroot
+
+# ── Wine (run Windows PE binaries) ────────────────────────────────────────────
+# wine64 handles x86_64 PEs natively when the sandbox itself runs on amd64.
+# i386 multiarch + wine32 are added only when building for amd64 (the i386
+# package set isn't available on arm64). On an arm64 sandbox, Wine can still
+# load ARM PEs natively; for x86/x86_64 PE coverage on arm64, rebuild this
+# image with `--platform linux/amd64` (slow but functional) — full-speed
+# x64-on-arm support would need box64/FEX, which is a separate layer.
+ENV WINEPREFIX=/opt/wineprefix
+ENV WINEDEBUG=-all
+ENV WINEDLLOVERRIDES=mscoree=;mshtml=
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "amd64" ]; then dpkg --add-architecture i386; fi \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends wine wine64 winbind \
+    && if [ "$ARCH" = "amd64" ]; then \
+         apt-get install -y --no-install-recommends wine32; \
+       fi \
+    && rm -rf /var/lib/apt/lists/* \
+    # Pre-init the Wine prefix so first run in a fresh container doesn't
+    # eat ~30s bootstrapping. WINEDLLOVERRIDES disables the gecko/mono
+    # installer prompts, so no display is needed.
+    && wineboot --init 2>&1 | tail -5 || true \
+    && wineserver -w || true
+
+# ── More system packages (pwn / fuzzing / forensics / crypto / Android) ─────
+# Single apt layer to keep image-layer count down. wireshark debconf preseed
+# avoids interactive "should non-root capture?" prompt during install.
+RUN echo "wireshark-common wireshark-common/install-setuid boolean false" \
+        | debconf-set-selections \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        # Pwn / patch
+        patchelf upx-ucl \
+        # Coverage-guided fuzzers (honggfuzz built from source below)
+        afl++ \
+        # Network forensics
+        tshark tcpdump ngrep \
+        # Disk + registry forensics (bulk_extractor not in jammy; use foremost/binwalk)
+        chntpw \
+        # Android (jadx already installed earlier; apksigner+zipalign live in
+        # google-android-build-tools-installer / android-sdk-build-tools but
+        # apt's `aapt` is enough for manifest dumps without the full SDK)
+        apktool aapt \
+        # Web fingerprinting / scanning
+        whatweb nikto \
+        # SMB/AD recon (offensive — only used in authorized CTF contexts)
+        # enum4linux dropped from jammy; using enum4linux-ng via pip instead
+        smbclient \
+        # MQTT (IoT challenges)
+        mosquitto-clients \
+        # WebAssembly toolkit (wasm2wat / wat2wasm / wasm-decompile / wasm-objdump)
+        wabt \
+        # JPEG steganography (complements zsteg for PNG/BMP)
+        outguess \
+        # Protobuf compiler/decoder (binary blob inspection)
+        protobuf-compiler \
+        # Password cracking + pocl (CPU OpenCL runtime so hashcat works headless)
+        hashcat john \
+        pocl-opencl-icd ocl-icd-libopencl1 \
+        # Online password attacks (OSCP staples)
+        hydra ncrack \
+        # Wordlist generation
+        crunch \
+        # SNMP enumeration
+        onesixtyone snmp-mibs-downloader \
+        # Pivoting via socks/http chain
+        proxychains4 \
+        # Wide-net port sweeps (faster than nmap for /16+ scans)
+        masscan \
+        # Alternative directory busters (ffuf is already there; these handle
+        # different chunking strategies and edge-cases)
+        gobuster wfuzz \
+        # Wireless (WPA/WEP cracking, WPS attacks; needs a .cap file or
+        # monitor-mode interface — sandbox can run aircrack-ng on captures)
+        aircrack-ng reaver \
+        # Cloud (AWS recon/exploitation; gcloud/az skipped — too heavy)
+        awscli \
+        # Custom-wordlist generator (was incorrectly in the Ruby gem block —
+        # cewl is published as a Debian package, not a published gem)
+        cewl \
+        # SMB enumeration (smbclient is the basic client, smbmap layers on
+        # share-mapping/permission summaries)
+        smbmap \
+        # PE cross-compilation
+        mingw-w64 \
+        # YARA CLI (yara-python already installed; this adds the binary)
+        yara \
+        # PDF analysis
+        poppler-utils \
+        # RegRipper deps
+        libparse-win32registry-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Additional Python libraries — split into themed blocks so a single bad ──
+# transitive pin doesn't tank the whole layer. Risky blocks tolerate failure;
+# the well-behaved core block does not.
+# (angr/capstone/unicorn/ROPgadget/yara-python/lief/pyelftools/keystone already
+# installed in the FLARE block above.)
+
+# Core: pure-python / well-wheeled. Failure here IS fatal.
+RUN python3 -m pip install --no-cache-dir \
+    angr-utils \
+    ropper \
+    uncompyle6 decompyle3 pyinstxtractor-ng \
+    pyjwt \
+    clairvoyance \
+    oletools \
+    bandit safety \
+    androguard \
+    hashid
+
+# Network + dynamic instrumentation.
+RUN python3 -m pip install --no-cache-dir \
+    scapy mitmproxy frida-tools objection
+
+# AD/SMB + media + Android dynamic + OSCP-style offensive tooling +
+# OSINT/Cloud/Firmware/AI-security extras — split per-tool so transitive
+# conflicts don't tank the whole layer. Best-effort.
+#
+# Dropped:
+#   * netexec  — install pulls a fork of impacket + downgrades unicorn,
+#                z3-solver, cryptography, breaking angr/claripy/joserfc.
+#                We have impacket directly; that covers the same protocols.
+#   * recon-ng — not pip-installable (no setup.py/pyproject.toml on its
+#                github root); installed separately via git clone below.
+#   * theHarvester — pypi `theharvester==0.0.1` is a stub package; the
+#                real upstream requires Python 3.12+ which we manage via
+#                uv, so a system pip install is infeasible. Skipped; we
+#                have subfinder/dnsrecon/photon/sherlock for OSINT.
+RUN set +e; \
+    for pkg in impacket drozer yt-dlp \
+               responder mitm6 pypykatz dnsrecon \
+               pwncat-cs updog bloodhound \
+               sherlock-project photon \
+               prowler gpp-decrypt \
+               pacu \
+               jefferson ubi_reader \
+               adversarial-robustness-toolbox garak \
+               unipacker; do \
+      python3 -m pip install --no-cache-dir "$pkg" || echo "$pkg install failed (non-fatal)"; \
+    done; \
+    # enum4linux-ng has no pypi release, install from git
+    python3 -m pip install --no-cache-dir \
+        "git+https://github.com/cddmp/enum4linux-ng.git" \
+        || echo "enum4linux-ng git install failed (non-fatal)"; \
+    true
+
+# Symbolic execution complements. manticore/triton occasionally hit numpy
+# ABI issues on arm64 py3.10 — non-fatal so we can still ship the rest.
+# (Both stay in the shared env: they're imported as libraries, coexist with
+# the shared stack, and manticore's deps don't resolve in a from-scratch
+# isolated venv on arm64/py3.10. mythril — which DID downgrade shared z3 — is
+# the one moved to its own venv below.)
+RUN python3 -m pip install --no-cache-dir manticore triton \
+    || echo "manticore/triton install failed (non-fatal)"
+
+# Smart-contract Python stack — split per-tool so one bad transitive doesn't
+# wipe out all four CLIs. Foundry CLI is still the primary path; these are
+# convenience extras.
+RUN set +e; \
+    for pkg in slither-analyzer solc-select web3 eth-abi eth-utils; do \
+      python3 -m pip install --no-cache-dir "$pkg" || echo "$pkg install failed (non-fatal)"; \
+    done; \
+    true
+# ── Isolated, version-pinned tool venvs ─────────────────────────────────────
+# Tools whose dependency pins fight the shared 3.10 site-packages (or need a
+# different Python) live in their own venvs, exposed via PATH shims. The main
+# python keeps the importable RE stack (pwntools / angr 9.2.x / z3 / etc.)
+# clean; these wrappers are CLI-only and never imported by solver scripts.
+#
+# Oxidizer (Rust decompiler) ships inside angr >=9.2.217, which is Python
+# 3.12+ only — hence a dedicated deadsnakes py3.12 venv. Far cleaner than
+# Ghidra/r2 on Rust binaries. Invoke as: rust-decompile <binary> [--functions N]
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.12 -m venv /opt/venvs/oxidizer \
+    && /opt/venvs/oxidizer/bin/pip install --no-cache-dir -U pip wheel \
+    && /opt/venvs/oxidizer/bin/pip install --no-cache-dir 'angr==9.2.217' \
+    && printf '#!/bin/bash\nexec /opt/venvs/oxidizer/bin/python -m angr decompile --rust "$@"\n' \
+       > /usr/local/bin/rust-decompile \
+    && chmod +x /usr/local/bin/rust-decompile \
+    || echo "oxidizer venv install failed (non-fatal — main-python angr/ghidra/r2 still cover C-style decompilation)"
+
+# mythril (myth) — pins an older z3-solver that would downgrade the shared
+# angr/claripy/joserfc stack; isolated so it can't.
+RUN python3 -m venv /opt/venvs/mythril \
+    && /opt/venvs/mythril/bin/pip install --no-cache-dir mythril \
+    && ln -sf /opt/venvs/mythril/bin/myth /usr/local/bin/myth \
+    || echo "mythril venv install failed (non-fatal — slither covers most static analysis)"
+
+# Steg automation — heavy installer, sometimes unavailable.
+RUN python3 -m pip install --no-cache-dir stegoveritas \
+    || echo "stegoveritas install failed (non-fatal)"
+
+# ── honggfuzz (build from source — not packaged in jammy) ───────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libbfd-dev libunwind-dev libblocksruntime-dev clang \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth=1 https://github.com/google/honggfuzz /tmp/hf \
+    && cd /tmp/hf && make -j$(nproc) && make install \
+    && cd / && rm -rf /tmp/hf \
+    || echo "honggfuzz build failed (non-fatal)"
+
+# ── graphql-cop (no pip package; clone + wrapper script) ────────────────────
+RUN git clone --depth=1 https://github.com/dolevf/graphql-cop.git /opt/graphql-cop \
+    && python3 -m pip install --no-cache-dir -r /opt/graphql-cop/requirements.txt \
+    && printf '#!/bin/bash\nexec python3 /opt/graphql-cop/graphql-cop.py "$@"\n' \
+       > /usr/local/bin/graphql-cop \
+    && chmod +x /usr/local/bin/graphql-cop \
+    || echo "graphql-cop install failed (non-fatal)"
+
+# ── pycdc (modern Python decompiler — supports 3.10+ where uncompyle6 fails) ─
+RUN git clone --depth=1 https://github.com/zrax/pycdc /tmp/pycdc \
+    && cd /tmp/pycdc && cmake . && make -j$(nproc) \
+    && cp pycdc pycdas /usr/local/bin/ \
+    && rm -rf /tmp/pycdc
+
+# ── retdec (open-source LLVM-based decompiler) ──────────────────────────────
+# Fills the IDA/Hex-Rays-shaped hole for solvers that prefer C output over
+# r2's `pdc` or ghidra-headless. Pre-built tarball is amd64-only, so on
+# arm64 we build from source (slow but functional). The build is heavy
+# (~30-60 min) and bandwidth-bound; mark it non-fatal so a transient
+# upstream hiccup doesn't tank the whole image.
+RUN ARCH=$(dpkg --print-architecture) \
+    && set +e \
+    && if [ "$ARCH" = "amd64" ]; then \
+         curl -fsSL "https://github.com/avast/retdec/releases/download/v5.0/retdec-v5.0-ubuntu-22.04.tar.xz" \
+              -o /tmp/retdec.tar.xz \
+           && mkdir -p /opt/retdec \
+           && tar -xJf /tmp/retdec.tar.xz -C /opt/retdec --strip-components=1 \
+           && ln -sf /opt/retdec/bin/retdec-decompiler /usr/local/bin/retdec-decompiler \
+           && ln -sf /opt/retdec/bin/retdec-decompiler /usr/local/bin/retdec \
+           && rm /tmp/retdec.tar.xz; \
+       else \
+         echo "retdec: arm64 — skipping pre-built download. Falling back to r2's pdc + ghidra-headless"; \
+       fi; \
+    true
+
+# ── pwndbg (default GDB plugin — heap, vmmap, telescope, ROP) ────────────────
+RUN git clone --depth=1 https://github.com/pwndbg/pwndbg /opt/pwndbg \
+    && cd /opt/pwndbg && ./setup.sh || echo "pwndbg setup had warnings"
+
+# ── gef (alternative GDB plugin — kept side-by-side with pwndbg) ─────────────
+# Loaded explicitly via: gdb -x /opt/gef.py
+RUN curl -fsSL -o /opt/gef.py https://gef.blah.cat/py || true
+
+# ── one_gadget (libc one-shot RCE finder) ────────────────────────────────────
+RUN gem install one_gadget
+
+# ── dex2jar (Android: convert .dex/.apk → .jar for jadx/javap) ───────────────
+RUN curl -fsSL "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip" \
+        -o /tmp/d2j.zip \
+    && unzip -q /tmp/d2j.zip -d /opt/ \
+    && mv /opt/dex-tools-v2.4 /opt/dex2jar \
+    && chmod +x /opt/dex2jar/*.sh \
+    && for s in /opt/dex2jar/d2j-*.sh; do \
+         ln -s "$s" "/usr/local/bin/$(basename "$s" .sh)"; \
+       done \
+    && rm /tmp/d2j.zip
+
+# ── Ghidra full standalone (analyzeHeadless, batch RE recipes) ──────────────
+# Java already installed earlier (default-jdk-headless).
+#
+# Solver-discoverability matters here: gpt-5.5 frequently runs
+# `which ghidra` to decide whether to use Ghidra or fall back to r2's
+# pdc. With only `ghidra-headless` symlinked, that probe returns empty
+# and the solver gives up on Ghidra. We add a `ghidra` symlink to the
+# headless wrapper AND set GHIDRA_INSTALL_DIR so `pyghidra.start()`
+# (used in `python3 - <<'PY' import pyghidra; ...` blocks observed in
+# traces) can boot without operator intervention.
+RUN curl -fsSL \
+      "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_11.2.1_build/ghidra_11.2.1_PUBLIC_20241105.zip" \
+      -o /tmp/ghidra.zip \
+    && unzip -q /tmp/ghidra.zip -d /opt/ \
+    && mv /opt/ghidra_11.2.1_PUBLIC /opt/ghidra \
+    && ln -s /opt/ghidra/support/analyzeHeadless /usr/local/bin/ghidra-headless \
+    && ln -s /opt/ghidra/support/analyzeHeadless /usr/local/bin/ghidra \
+    && ln -s /opt/ghidra/support/analyzeHeadless /usr/local/bin/analyzeHeadless \
+    && rm /tmp/ghidra.zip
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra
+
+# ── Detect-It-Easy (packer / compiler / protector identification) ────────────
+# Skip silently if no release available for the build arch.
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) DIE_DEB="die_3.10_Ubuntu_22.04_amd64.deb" ;; \
+         arm64) DIE_DEB="die_3.10_Ubuntu_22.04_arm64.deb" ;; \
+         *)     DIE_DEB="" ;; \
+       esac \
+    && if [ -n "$DIE_DEB" ]; then \
+         curl -fsSL "https://github.com/horsicq/DIE-engine/releases/download/3.10/$DIE_DEB" \
+              -o /tmp/die.deb \
+           && (apt-get update \
+                && apt-get install -y --no-install-recommends /tmp/die.deb \
+                && rm -rf /var/lib/apt/lists/*) \
+           || echo "DiE install failed (non-fatal)"; \
+         rm -f /tmp/die.deb; \
+       else \
+         echo "DiE: no release for $ARCH — skipping"; \
+       fi
+
+# ── pwninit (one-shot pwn challenge prep — patches binary, sets RPATH) ───────
+# Use the pre-built x86_64 release on amd64; build from source otherwise.
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "amd64" ]; then \
+         curl -fsSL https://github.com/io12/pwninit/releases/latest/download/pwninit \
+              -o /usr/local/bin/pwninit \
+           && chmod +x /usr/local/bin/pwninit; \
+       else \
+         echo "pwninit: building from source for $ARCH (cargo install) — see Rust block below"; \
+       fi
+
+# ── Go toolchain (powers nuclei / gore / redress / gau / waybackurls / gosec / gitleaks) ──
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in amd64) GOA=amd64 ;; arm64) GOA=arm64 ;; *) GOA=amd64 ;; esac \
+    && curl -fsSL "https://go.dev/dl/go1.23.4.linux-${GOA}.tar.gz" -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH="/usr/local/go/bin:/root/go/bin:$PATH"
+ENV GOPATH=/root/go
+
+# ── Go-installed tools ───────────────────────────────────────────────────────
+# Per-tool || true so one upstream rename doesn't tank the whole layer.
+# (gore moved to library-only; the user-facing CLI is redress.)
+RUN set +e; \
+    LD='-ldflags=-s -w'; \
+    go install "$LD" github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || echo "nuclei install failed"; \
+    go install "$LD" github.com/goretk/redress@latest || echo "redress install failed"; \
+    go install "$LD" github.com/lc/gau/v2/cmd/gau@latest || echo "gau install failed"; \
+    go install "$LD" github.com/tomnomnom/waybackurls@latest || echo "waybackurls install failed"; \
+    go install "$LD" github.com/securego/gosec/v2/cmd/gosec@latest || echo "gosec install failed"; \
+    go install "$LD" github.com/zricethezav/gitleaks/v8@latest || echo "gitleaks install failed"; \
+    go install "$LD" github.com/ropnop/kerbrute@latest || echo "kerbrute install failed"; \
+    go install "$LD" github.com/jpillora/chisel@latest || echo "chisel install failed"; \
+    [ -x /root/go/bin/chisel ] && ln -sf /root/go/bin/chisel /usr/local/bin/chisel-pivot || true; \
+    go install "$LD" github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || echo "subfinder install failed"; \
+    go install "$LD" github.com/projectdiscovery/httpx/cmd/httpx@latest || echo "httpx install failed"; \
+    go install "$LD" github.com/BishopFox/cloudfox@latest || echo "cloudfox install failed"; \
+    true
+
+# ── Cloud SDK clients (kubectl + gcloud + Azure CLI) ─────────────────────────
+# kubectl is a single static Go binary (~50 MB).
+# gcloud + az pull their own vendor apt repos (~500 + ~300 MB).
+# Pacu (Rhino's AWS exploitation framework) is pip-installed in the
+# per-tool block above.
+
+RUN ARCH=$(dpkg --print-architecture) \
+    && KVER=$(curl -fsSL https://dl.k8s.io/release/stable.txt) \
+    && curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/${ARCH}/kubectl" \
+       -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl \
+    && kubectl version --client=true
+
+# Google Cloud SDK — `gcloud`, `gsutil`, `bq`. Adds Google's apt repo.
+RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+       | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+       > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-cloud-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Azure CLI — `az`. The vendor's installer script handles arch detection,
+# repo registration, key fetch, and apt-get install. Works on jammy for
+# both amd64 and arm64.
+RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Rust toolchain + cargo-installed tools ──────────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+ENV PATH="/root/.cargo/bin:$PATH"
+RUN ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" != "amd64" ]; then \
+         cargo install pwninit --locked || echo "pwninit cargo build failed (non-fatal)"; \
+       fi
+
+# feroxbuster — fast Rust dir buster, complements ffuf for large lists.
+RUN cargo install feroxbuster --locked || echo "feroxbuster cargo build failed (non-fatal)"
+
+# ── .NET SDK + ILSpy decompiler (also runs ysoserial.net) ────────────────────
+# .NET SDK install is fatal; ilspycmd install is non-fatal because recent
+# nuget packages of ilspycmd have shipped a malformed DotnetToolSettings.xml.
+# We try the latest first, then fall back to a known-good 8.x release.
+RUN curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb \
+        -o /tmp/ms.deb \
+    && dpkg -i /tmp/ms.deb \
+    && rm /tmp/ms.deb \
+    && apt-get update && apt-get install -y --no-install-recommends dotnet-sdk-8.0 \
+    && rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.dotnet/tools:$PATH"
+RUN dotnet tool install -g ilspycmd \
+      || dotnet tool install -g ilspycmd --version 8.2.0.7535 \
+      || echo "ilspycmd install failed (non-fatal — Ghidra/dnSpy alternatives available)"
+
+# de4dot was considered but `de4dot.cex` is not on NuGet and the
+# distributed pre-builts target Windows/Mono, which we don't ship.
+# Skipping until a clean cross-platform install path appears.
+
+# ── ysoserial (Java deserialization gadget chains) ──────────────────────────
+RUN curl -fsSL \
+      "https://github.com/frohoff/ysoserial/releases/download/v0.0.6/ysoserial-all.jar" \
+      -o /opt/ysoserial.jar \
+    && printf '#!/bin/bash\nexec java -jar /opt/ysoserial.jar "$@"\n' \
+       > /usr/local/bin/ysoserial \
+    && chmod +x /usr/local/bin/ysoserial
+
+# ── ysoserial.net (.NET deserialization) ────────────────────────────────────
+# Asset names vary (sha-suffixed zip); take the first .zip in the latest release.
+RUN URL=$(curl -fsSL https://api.github.com/repos/pwntester/ysoserial.net/releases/latest \
+           | jq -r '.assets[] | select(.name | endswith(".zip")).browser_download_url' | head -1) \
+    && if [ -n "$URL" ] && [ "$URL" != "null" ]; then \
+         curl -fsSL "$URL" -o /tmp/ysoserial-net.zip \
+           && mkdir -p /opt/ysoserial-net \
+           && unzip -q /tmp/ysoserial-net.zip -d /opt/ysoserial-net \
+           && rm /tmp/ysoserial-net.zip \
+           && BIN=$(find /opt/ysoserial-net -maxdepth 4 \
+                       \( -name 'ysoserial.dll' -o -name 'ysoserial.exe' \) \
+                       | head -1) \
+           && if [ -n "$BIN" ]; then \
+                printf '#!/bin/bash\nexec dotnet %s "$@"\n' "$BIN" \
+                  > /usr/local/bin/ysoserial-net \
+                && chmod +x /usr/local/bin/ysoserial-net; \
+              else \
+                echo "ysoserial-net: no .dll/.exe found in archive"; \
+              fi; \
+       else \
+         echo "ysoserial.net: no matching release found — skipping"; \
+       fi
+
+# ── Foundry (Ethereum dev: forge / cast / anvil / chisel) ───────────────────
+RUN curl -fsSL https://foundry.paradigm.xyz | bash \
+    && /root/.foundry/bin/foundryup
+ENV PATH="/root/.foundry/bin:$PATH"
+
+# ── searchsploit (offline exploit-db CLI — `exploitdb` apt was dropped) ─────
+RUN git clone --depth=1 https://gitlab.com/exploit-database/exploitdb.git /opt/exploitdb \
+    && ln -sf /opt/exploitdb/searchsploit /usr/local/bin/searchsploit \
+    || echo "exploitdb clone failed (non-fatal)"
+
+# ── recon-ng (modular recon framework — git only, no pypi release) ──────────
+RUN git clone --depth=1 https://github.com/lanmaster53/recon-ng.git /opt/recon-ng \
+    && python3 -m pip install --no-cache-dir -r /opt/recon-ng/REQUIREMENTS \
+    && printf '#!/bin/bash\nexec python3 /opt/recon-ng/recon-ng "$@"\n' \
+       > /usr/local/bin/recon-ng \
+    && chmod +x /usr/local/bin/recon-ng \
+    || echo "recon-ng install failed (non-fatal)"
+
+# ── phpggc (PHP deserialization gadget chains — pairs with ysoserial[.net]) ─
+RUN git clone --depth=1 https://github.com/ambionics/phpggc /opt/phpggc \
+    && ln -sf /opt/phpggc/phpggc /usr/local/bin/phpggc
+
+# ── unluac (Lua 5.1-5.4 bytecode decompiler — single jar) ────────────────────
+RUN curl -fsSL "https://sourceforge.net/projects/unluac/files/latest/download" \
+       -o /opt/unluac.jar \
+    && printf '#!/bin/bash\nexec java -jar /opt/unluac.jar "$@"\n' \
+       > /usr/local/bin/unluac \
+    && chmod +x /usr/local/bin/unluac \
+    || echo "unluac download failed (non-fatal)"
+
+# ── sasquatch (patched unsquashfs that handles non-standard squashfs) ──────
+# Many IoT firmwares ship modified squashfs that vanilla unsquashfs chokes on.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        liblzma-dev liblzo2-dev zlib1g-dev libzstd-dev libxml2-dev squashfs-tools \
+    && git clone --depth=1 https://github.com/devttys0/sasquatch /tmp/sasquatch \
+    && cd /tmp/sasquatch \
+    && ./build.sh \
+    && rm -rf /tmp/sasquatch \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "sasquatch build failed (non-fatal — binwalk handles standard squashfs)"
+
+# ── PEAS suite + pspy (privesc enumeration scripts/binaries) ─────────────────
+# linpeas / winpeas are shell+ps1 scripts the agent runs against a target.
+# pspy is a self-contained Go binary that snoops cron/process activity
+# without root. We pull both architectures so cross-arch challenges work.
+RUN mkdir -p /opt/peas \
+    && curl -fsSL "https://github.com/peass-ng/PEASS-ng/releases/latest/download/linpeas.sh" \
+       -o /opt/peas/linpeas.sh \
+    && curl -fsSL "https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEAS.bat" \
+       -o /opt/peas/winpeas.bat \
+    && curl -fsSL "https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEASany.exe" \
+       -o /opt/peas/winpeas.exe \
+    && curl -fsSL "https://github.com/peass-ng/PEASS-ng/releases/latest/download/winPEAS.ps1" \
+       -o /opt/peas/winpeas.ps1 \
+    && curl -fsSL "https://github.com/DominicBreuker/pspy/releases/latest/download/pspy64" \
+       -o /opt/peas/pspy64 \
+    && curl -fsSL "https://github.com/DominicBreuker/pspy/releases/latest/download/pspy32" \
+       -o /opt/peas/pspy32 \
+    && chmod +x /opt/peas/linpeas.sh /opt/peas/pspy64 /opt/peas/pspy32 \
+    && ln -sf /opt/peas/linpeas.sh /usr/local/bin/linpeas \
+    && ln -sf /opt/peas/pspy64 /usr/local/bin/pspy64 \
+    && ln -sf /opt/peas/pspy32 /usr/local/bin/pspy32 \
+    || echo "PEAS/pspy download failed (non-fatal — challenges with internet can re-fetch at runtime)"
+
+# ── jwt_tool (JWT attacks: alg confusion, kid injection, weak secret crack) ──
+RUN git clone --depth=1 https://github.com/ticarpi/jwt_tool /opt/jwt_tool \
+    && python3 -m pip install --no-cache-dir -r /opt/jwt_tool/requirements.txt \
+    && printf '#!/bin/bash\nexec python3 /opt/jwt_tool/jwt_tool.py "$@"\n' \
+       > /usr/local/bin/jwt_tool \
+    && chmod +x /usr/local/bin/jwt_tool
+
+# ── RegRipper 3.0 (Windows registry forensics) ──────────────────────────────
+RUN git clone --depth=1 https://github.com/keydet89/RegRipper3.0 /opt/regripper \
+    && printf '#!/bin/bash\ncd /opt/regripper && exec perl rip.pl "$@"\n' \
+       > /usr/local/bin/regripper \
+    && chmod +x /usr/local/bin/regripper
+
+# ── plaso / log2timeline (event-log + artifact timeline) ────────────────────
+# Heavy Python deps; allowed to fail without tanking the build.
+RUN python3 -m pip install --no-cache-dir plaso || echo "plaso install failed (non-fatal)"
+
+# ── Didier Stevens PDF tools (pdfid, pdf-parser) ────────────────────────────
+RUN git clone --depth=1 https://github.com/DidierStevens/DidierStevensSuite /opt/dss \
+    && for tool in pdfid pdf-parser oledump; do \
+         if [ -f "/opt/dss/${tool}.py" ]; then \
+           printf '#!/bin/bash\nexec python3 /opt/dss/%s.py "$@"\n' "$tool" \
+             > "/usr/local/bin/$tool"; \
+           chmod +x "/usr/local/bin/$tool"; \
+         fi; \
+       done
+
+# ── Playwright + headless Chromium/Firefox (browser-driven web challenges) ──
+# Both engines: Chromium is the default for most XSS-bot / headless
+# automation, but Firefox clears some anti-bot challenges (Cloudflare
+# managed-challenge) that flag Chromium's automation fingerprint.
+RUN python3 -m pip install --no-cache-dir playwright \
+    && playwright install --with-deps chromium firefox \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ── YARA rules (Yara-Rules/rules — preloaded ruleset) ───────────────────────
+RUN git clone --depth=1 https://github.com/Yara-Rules/rules /opt/yara-rules
+
+# ── Wordlists: rockyou.txt + extended SecLists Passwords ────────────────────
+# Per-line || true so SecLists path drift doesn't tank the layer; rockyou is
+# the only one we'd really miss.
+RUN mkdir -p /opt/wordlists \
+    && set +e \
+    && curl -fsSL \
+        "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt" \
+        -o /opt/wordlists/rockyou.txt \
+        || echo "rockyou download failed (non-fatal)" \
+    && curl -fsSL \
+        "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/xato-net-10-million-passwords-100000.txt" \
+        -o /opt/wordlists/passwords-top100k.txt \
+        || echo "top-100k download failed (non-fatal)" \
+    && curl -fsSL \
+        "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/darkc0de.txt" \
+        -o /opt/wordlists/darkc0de.txt \
+        || echo "darkc0de download failed (non-fatal)" \
+    && set -e \
+    && ls -la /opt/wordlists/
+
+# ── Cross-compilers for foreign-arch Linux + bare-metal ARM ─────────────────
+# Pairs with qemu-user-static so we can both BUILD and RUN foreign-arch
+# binaries. Use cases: custom shellcode for ARM/MIPS/RISC-V Linux targets,
+# bare-metal Cortex-M firmware (gcc-arm-none-eabi), embedded payload dev.
+#
+# Installed per-package because availability differs by host arch — e.g.
+# powerpc-cross packages aren't in jammy-arm64, but a single missing
+# package would otherwise roll back the entire transaction. With per-pkg
+# install + || true we get maximum coverage for whatever the host supports.
+RUN apt-get update; \
+    set +e; \
+    for pkg in \
+        gcc-aarch64-linux-gnu  libc6-dev-arm64-cross \
+        gcc-arm-linux-gnueabi  libc6-dev-armel-cross \
+        gcc-arm-linux-gnueabihf libc6-dev-armhf-cross \
+        gcc-mips-linux-gnu      libc6-dev-mips-cross \
+        gcc-mipsel-linux-gnu    libc6-dev-mipsel-cross \
+        gcc-mips64-linux-gnuabi64 libc6-dev-mips64-cross \
+        gcc-riscv64-linux-gnu   libc6-dev-riscv64-cross \
+        gcc-powerpc-linux-gnu   libc6-dev-powerpc-cross \
+        gcc-powerpc64-linux-gnu libc6-dev-ppc64-cross \
+        gcc-arm-none-eabi; do \
+      apt-get install -y --no-install-recommends "$pkg" \
+        || echo "$pkg unavailable on this host arch (non-fatal)"; \
+    done; \
+    rm -rf /var/lib/apt/lists/*; \
+    true
+
+# ── Maven + Gradle (Java build automation for real-world Java apps) ─────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        maven gradle \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── PHP + Composer (web challenges, deserialization gadget testing) ─────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        php-cli php-curl php-mbstring php-xml php-zip php-bcmath \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -sSL https://getcomposer.org/installer | php -- \
+        --install-dir=/usr/local/bin --filename=composer \
+    && composer --version
+
+# ── Wordlist URL fix-up ─────────────────────────────────────────────────────
+# SecLists renamed `10-million-password-list-top-N.txt` to
+# `xato-net-10-million-passwords-N.txt`. Re-download with the new names
+# in a trailing layer so the earlier wordlist layers stay cached.
+RUN set +e; \
+    curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/xato-net-10-million-passwords-10000.txt" \
+        -o /opt/wordlists/passwords-top10k.txt \
+        || echo "passwords-top10k re-download failed (non-fatal)"; \
+    curl -fsSL "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/Common-Credentials/xato-net-10-million-passwords-100000.txt" \
+        -o /opt/wordlists/passwords-top100k.txt \
+        || echo "passwords-top100k re-download failed (non-fatal)"; \
+    true
+
+# ── i386 sysroot fix-up ─────────────────────────────────────────────────────
+# The earlier i386-sysroot block (under "qemu-user-static") fetches a hand-
+# rolled list of pinned `.deb` URLs from archive.ubuntu.com. Those pins drift
+# as Ubuntu rolls libc6 versions forward, and the URLs silently 404 — leaving
+# /opt/i386-sysroot with only ncurses extracted, no ld-linux.so.2, so
+# `qemu-i386-static ./binary` fails on every dynamically-linked i386 ELF.
+#
+# This trailing layer side-steps the pin-rot by using `apt-get download`
+# against archive.ubuntu.com (which actually hosts i386 packages — the host
+# arm64 sandbox normally talks to ports.ubuntu.com, which is arm64-only and
+# 404s on /binary-i386/). The apt-get update prints noise about ports.ubuntu
+# .com 404s for i386 indexes; those are warnings, not fatal — apt continues
+# and fetches the i386 .debs from archive.ubuntu.com successfully. Verified
+# end-to-end: `qemu-i386-static ./silver_bullet` now boots and serves its
+# menu inside the container.
+#
+# Placed at the very end of the Dockerfile so this fix doesn't invalidate
+# any of the heavy upstream layer caches (CADO-NFS, Ghidra, dotnet, etc.).
+RUN dpkg --add-architecture i386 \
+    && echo "deb [arch=i386] http://archive.ubuntu.com/ubuntu/ jammy main" \
+        > /etc/apt/sources.list.d/i386-sysroot.list \
+    && apt-get update -qq 2>/dev/null || true \
+    && rm -rf /opt/i386-sysroot \
+    && mkdir -p /opt/i386-sysroot /tmp/i386-debs \
+    && cd /tmp/i386-debs \
+    && apt-get download \
+         libc6:i386 \
+         libstdc++6:i386 \
+         libgcc-s1:i386 \
+         zlib1g:i386 \
+         libtinfo6:i386 \
+         libncurses6:i386 \
+    && for d in *.deb; do dpkg-deb -x "$d" /opt/i386-sysroot; done \
+    && cd / \
+    && rm -rf /tmp/i386-debs /var/lib/apt/lists/* \
+    && ln -sf /opt/i386-sysroot/lib/ld-linux.so.2 /lib/ld-linux.so.2 \
+    # Tear down the foreign-arch source. Leaving it in place breaks
+    # downstream `apt-get update` on arm64 builds because the arm64
+    # apt resolver routes `[arch=i386]` through ports.ubuntu.com,
+    # which doesn't host i386 — every subsequent update fetches
+    # 404s for the i386 Packages indexes. The architecture
+    # registration is also undone so later `apt-get install`
+    # invocations don't pull in i386 candidates by accident.
+    && rm -f /etc/apt/sources.list.d/i386-sysroot.list \
+    && dpkg --remove-architecture i386 || true
+
+# ── x86_64 sysroot ──────────────────────────────────────────────────────────
+# Parallel to the i386 sysroot above, for the much more common case of
+# x86_64 ELFs needing /lib64/ld-linux-x86-64.so.2 to start. Earlier
+# pwnable-{tw,kr} traces showed 30+ "ld-linux-x86-64.so.2: No such file"
+# failures when the agent tried to run a vendored x86_64 binary on the
+# arm64 sandbox.
+#
+# On a linux/amd64 build this block is mostly redundant (the host libc
+# already provides /lib64/ld-linux-x86-64.so.2) — the symlink at the
+# bottom just overwrites it with one pointing at our extracted copy of
+# the same glibc 2.35, which is harmless. The real lift is on arm64
+# builds where there's no native amd64 dynamic linker at all.
+RUN dpkg --add-architecture amd64 \
+    && echo "deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ jammy main" \
+        > /etc/apt/sources.list.d/amd64-sysroot.list \
+    && apt-get update -qq 2>/dev/null || true \
+    && mkdir -p /opt/x86_64-sysroot /tmp/amd64-debs \
+    && cd /tmp/amd64-debs \
+    && apt-get download \
+         libc6:amd64 \
+         libstdc++6:amd64 \
+         libgcc-s1:amd64 \
+         zlib1g:amd64 \
+         libtinfo6:amd64 \
+         libncurses6:amd64 \
+    && for d in *.deb; do dpkg-deb -x "$d" /opt/x86_64-sysroot; done \
+    && cd / \
+    && rm -rf /tmp/amd64-debs /var/lib/apt/lists/* \
+    && mkdir -p /lib64 \
+    && ln -sf /opt/x86_64-sysroot/lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2 \
+    # Same cleanup as the i386 block above — drop the foreign-arch
+    # source.list entry and dearchitecture so later `apt-get update`
+    # invocations don't 404 on ports.ubuntu.com. On native amd64
+    # builds removing the architecture is a no-op (it was already
+    # the host arch); the `|| true` covers that path.
+    && rm -f /etc/apt/sources.list.d/amd64-sysroot.list \
+    && dpkg --remove-architecture amd64 || true
+
+# ── Multi-version GLIBC sysroots (rev / pwn) ─────────────────────────────────
+# The single-version /opt/x86_64-sysroot above pins the agent to whatever
+# libc lives in the host distro (currently jammy / 2.35). pwn and rev
+# challenges routinely ship binaries built against an older or newer
+# glibc, and the model hits hard walls like
+#
+#   ./jerry: /opt/x86_64-sysroot/lib/x86_64-linux-gnu/libm.so.6:
+#       version `GLIBC_2.38' not found (required by ./jerry)
+#
+# Pre-extract a stable of common GLIBC versions so the agent can match
+# the binary's runtime requirement instead of fighting the sandbox's
+# default. The /opt/glibc/<short-version>/ tree contains the full deb
+# extract — `lib/x86_64-linux-gnu/libc.so.6`, `lib64/ld-linux-x86-64.so.2`,
+# the matching libm/libpthread/libdl/librt, plus libstdc++ for C++ pwn.
+#
+# Versions chosen to span the common pwn corpus:
+#   2.23  Ubuntu 16.04 — pwnable.tw, picoCTF, older university CTFs
+#   2.27  Ubuntu 18.04 — bread-and-butter pwn baseline
+#   2.31  Ubuntu 20.04 — common modern pwn (tcache safe-linking era)
+#   2.35  Ubuntu 22.04 — current host default, also extracted here for
+#                         path uniformity so callers always use /opt/glibc
+#   2.39  Ubuntu 24.04 — recent pwn (covers GLIBC_2.34/2.36/2.38 reqs)
+#
+# Failures are non-fatal so a single broken upstream URL doesn't break
+# the whole image build. The wrapper script `glibc-run` (installed below)
+# composes the right LD_PRELOAD chain so callers don't have to remember
+# the verbose --library-path incantation.
+# Dynamic patch-version lookup. Ubuntu rolls libc6 forward via security
+# updates; pinning a specific patch (e.g. 2.35-0ubuntu3.10) breaks the
+# build the next time the version increments. Instead, fetch the pool
+# listing once, regex out every libc6_<minor>-*_amd64.deb, and pick the
+# version-sorted-tail per minor we want. Self-healing across upstream
+# patch bumps.
+#
+# Suite is irrelevant — Debian's pool model keeps packages by name, not
+# by release. xenial, bionic, focal, jammy, noble all share the same
+# /pool/main/g/glibc directory.
+RUN mkdir -p /opt/glibc \
+    && POOL="http://archive.ubuntu.com/ubuntu/pool/main/g/glibc" \
+    # Index of every libc6 minor in the pool. Strip _amd64.deb before
+    # version-sort so `sort -V` doesn't put bare `-3ubuntu1` after
+    # `-3ubuntu1.6` (the trailing `_` in the un-stripped form lexes
+    # higher than `.` and selects the wrong patch).
+    && INDEX=$(curl -fsSL "$POOL/" \
+               | grep -oE 'libc6_2\.[0-9]+[^"_]*_amd64\.deb' \
+               | sed 's/_amd64\.deb$//' \
+               | sort -uV) \
+    && for ver in 2.23 2.27 2.31 2.35 2.39; do \
+         stem=$(echo "$INDEX" | grep "^libc6_${ver}-" | tail -1); \
+         if [ -z "$stem" ]; then \
+             echo "skipped /opt/glibc/$ver — no libc6_${ver}-*_amd64.deb in pool"; \
+             continue; \
+         fi; \
+         deb="${stem}_amd64.deb"; \
+         echo "==> /opt/glibc/$ver  ($deb)"; \
+         cd /tmp && rm -f libc6.deb; \
+         (curl -fsSL "$POOL/$deb" -o libc6.deb \
+          && mkdir -p "/opt/glibc/$ver" \
+          && dpkg-deb -x libc6.deb "/opt/glibc/$ver") \
+           || echo "skipped /opt/glibc/$ver — fetch/extract failed"; \
+         rm -f libc6.deb; \
+         # Usrmerge fixup: Ubuntu 24.04+ debs put files at /usr/lib/* \
+         # rather than /lib/*. Without this, smoke checks + downstream \
+         # callers that hard-code /opt/glibc/<ver>/lib/x86_64-linux-gnu \
+         # fail to find libc.so.6 even though the extract succeeded. \
+         # Symlink /lib → /usr/lib so both shapes resolve to one place. \
+         if [ -d "/opt/glibc/$ver/usr/lib/x86_64-linux-gnu" ] \
+            && [ ! -e "/opt/glibc/$ver/lib/x86_64-linux-gnu" ]; then \
+             mkdir -p "/opt/glibc/$ver/lib"; \
+             ln -sfn ../usr/lib/x86_64-linux-gnu "/opt/glibc/$ver/lib/x86_64-linux-gnu"; \
+         fi; \
+         if [ -d "/opt/glibc/$ver/usr/lib64" ] \
+            && [ ! -e "/opt/glibc/$ver/lib64" ]; then \
+             ln -sfn ./usr/lib64 "/opt/glibc/$ver/lib64"; \
+         fi; \
+       done
+
+# Convenience wrapper: `glibc-run <version> <binary> [args...]`. Composes
+# the right ld-linux + --library-path so callers don't have to remember
+# the incantation. Lists available versions when invoked with no args.
+# Written via printf %b so a single RUN layer produces a valid script
+# without depending on buildkit RUN-heredoc syntax.
+RUN printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '# glibc-run <version> <binary> [args...] — run a Linux/x86_64 binary' \
+    '# against the GLIBC version under /opt/glibc/<version>/. With no args,' \
+    '# lists installed versions.' \
+    'set -e' \
+    'if [ $# -lt 1 ]; then' \
+    '    echo "Available glibc versions under /opt/glibc/:"' \
+    '    ls -1 /opt/glibc/ 2>/dev/null | sed "s/^/  /" || true' \
+    '    echo' \
+    '    echo "Usage: glibc-run <version> <binary> [args...]"' \
+    '    exit 0' \
+    'fi' \
+    'VER="$1"; shift' \
+    'ROOT="/opt/glibc/$VER"' \
+    'LD="$ROOT/lib64/ld-linux-x86-64.so.2"' \
+    'LIBS="$ROOT/lib/x86_64-linux-gnu:$ROOT/lib64:$ROOT/usr/lib/x86_64-linux-gnu"' \
+    'if [ ! -x "$LD" ]; then' \
+    '    echo "glibc-run: $ROOT not found or missing ld-linux-x86-64.so.2" >&2' \
+    '    echo "Available:" >&2' \
+    '    ls -1 /opt/glibc/ 2>/dev/null | sed "s/^/  /" >&2' \
+    '    exit 2' \
+    'fi' \
+    'exec "$LD" --library-path "$LIBS" "$@"' \
+    > /usr/local/bin/glibc-run \
+    && chmod +x /usr/local/bin/glibc-run
+
+# ── GitHub CLI (Supply Chain / Rogue Commits / GitHub Actions challenges) ────
+# `gh` for PR / workflow / API operations against attacker-controlled forks.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update -qq \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Zig toolchain (kernel exploits, no-libc shellcode) ───────────────────────
+# Used in XSS_Kernel-style challenges where the model wants `zig cc` for
+# freestanding amd64 builds. Pin a known-good version; tarball install
+# avoids the apt repo lag.
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) ZARCH=x86_64 ;; \
+         arm64) ZARCH=aarch64 ;; \
+         *) ZARCH="$ARCH" ;; \
+       esac \
+    && ZVER=0.14.0 \
+    && curl -fsSL "https://ziglang.org/download/${ZVER}/zig-linux-${ZARCH}-${ZVER}.tar.xz" \
+         -o /tmp/zig.tar.xz \
+    && mkdir -p /opt/zig \
+    && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 \
+    && ln -sf /opt/zig/zig /usr/local/bin/zig \
+    && rm /tmp/zig.tar.xz
+
+# ── Tool-name shims (model muscle-memory matches package CLI ≠ binary) ──────
+# volatility3's CLI ships as `vol`; the model keeps typing `volatility3`
+# from training-data muscle memory and bouncing off "command not found".
+# Cheap symlink dodges 6+ wasted turns observed across thcon-2026 traces.
+RUN if command -v vol >/dev/null 2>&1; then \
+        ln -sf "$(command -v vol)" /usr/local/bin/volatility3; \
+    fi
+
+# ── Callback / tunnel toolkit ───────────────────────────────────────────────
+# webhook.site is fine for one-shot capture but cannot respond, which limits
+# SSRF→RCE chains, OAuth callbacks, blind XSS payload delivery, etc. These
+# three binaries cover the missing modes:
+#
+#   cloudflared       HTTP(S) tunnel    -> *.trycloudflare.com   (no auth)
+#   bore              raw TCP tunnel    -> bore.pub:RANDOM_PORT  (no auth)
+#   interactsh-client OOB DNS/HTTP/SMTP -> *.oast.* domain       (no auth, capture-only)
+#
+# An `expose-port <port>` helper prints reachable VPN/docker addresses plus
+# copy-paste tunnel commands for the given local port — see /usr/local/bin/expose-port.
+RUN set -eux \
+    && ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         arm64) CF_ARCH=arm64 ; BORE_ARCH=aarch64 ; ISH_ARCH=arm64 ;; \
+         amd64) CF_ARCH=amd64 ; BORE_ARCH=x86_64  ; ISH_ARCH=amd64 ;; \
+         *) echo "unsupported arch: $ARCH" ; exit 1 ;; \
+       esac \
+    && curl -fsSL -o /tmp/cloudflared.deb \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}.deb" \
+    && dpkg -i /tmp/cloudflared.deb \
+    && rm /tmp/cloudflared.deb \
+    && BORE_VER=v0.6.0 \
+    && curl -fsSL -o /tmp/bore.tgz \
+        "https://github.com/ekzhang/bore/releases/download/${BORE_VER}/bore-${BORE_VER}-${BORE_ARCH}-unknown-linux-musl.tar.gz" \
+    && tar -xzf /tmp/bore.tgz -C /usr/local/bin bore \
+    && chmod +x /usr/local/bin/bore \
+    && rm /tmp/bore.tgz \
+    && ISH_VER=$(curl -fsSL https://api.github.com/repos/projectdiscovery/interactsh/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//') \
+    && curl -fsSL -o /tmp/ish.zip \
+        "https://github.com/projectdiscovery/interactsh/releases/download/v${ISH_VER}/interactsh-client_${ISH_VER}_linux_${ISH_ARCH}.zip" \
+    && unzip -j /tmp/ish.zip interactsh-client -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/interactsh-client \
+    && rm /tmp/ish.zip \
+    && cloudflared --version \
+    && bore --version \
+    && interactsh-client -version 2>&1 | grep -q 'Current Version'
+
+COPY sandbox/expose-port /usr/local/bin/expose-port
+RUN chmod +x /usr/local/bin/expose-port
+
+# ── TLS-SNI tunnel toolkit ───────────────────────────────────────────────────
+# Some CTF platforms (Break The Syntax / bts.wh.edu.pl) front their TCP
+# challenges with a TLS-SNI multiplexer; the SNI hostname picks the
+# backend pod and the TLS layer wraps the raw TCP stream. Solvers can't
+# `nc HOST PORT` directly — they need a tool that opens TLS, sends SNI,
+# and proxies bytes.
+#
+#   snicat (./sc -b <localport> <SNI_HOST>) — purpose-built CTFd helper
+#       https://github.com/CTFd/snicat
+#       Bind to 127.0.0.1:<port>, tunnel to the remote via TLS+SNI.
+#       Then `nc localhost <port>` works as if it were a plain TCP target.
+#
+#   socat — generic Swiss-army stream forwarder. Equivalent to snicat:
+#       socat TCP-LISTEN:<port>,fork,reuseaddr OPENSSL:<host>:443,sni=<host>,verify=0
+#       Useful as a fallback or for non-CTFd TLS-SNI surfaces.
+#
+# Both are added as a late layer so the heavy upstream toolchains
+# (Ghidra, Wine, Foundry, etc.) stay cached on rebuild.
+RUN set -eux \
+    && ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         arm64) SC_ARCH=Linux_arm64 ;; \
+         amd64) SC_ARCH=Linux_x86_64 ;; \
+         *) echo "unsupported arch: $ARCH" ; exit 1 ;; \
+       esac \
+    && curl -fsSL -o /usr/local/bin/sc \
+        "https://github.com/CTFd/snicat/releases/latest/download/sc_${SC_ARCH}" \
+    && chmod +x /usr/local/bin/sc \
+    && /usr/local/bin/sc --help >/dev/null 2>&1 || true \
+    && echo "snicat installed at /usr/local/bin/sc (arch=$SC_ARCH)" \
+    && (apt-get update && apt-get install -y --no-install-recommends socat \
+        && rm -rf /var/lib/apt/lists/* \
+        && socat -V 2>&1 | head -1) \
+       || echo "socat install non-fatal — falling back to snicat / openssl s_client"
+
+# ── Category-targeted toolchains (late layer for cache warmth) ───────────────
+# Driven by trace analysis of multi-CTF runs: these are the tools
+# solvers tried to `apt install` / `pip install` mid-solve, costing
+# 30-60s install latency × concurrent solvers + extra recon turns.
+# Baking them in eliminates that overhead.
+#
+#   AVR microcontroller toolchain (e.g. reversing.kr CustomShell):
+#     gcc-avr / binutils-avr / avr-libc / simavr — assemble, link,
+#     disassemble, and emulate AVR firmware images.
+#
+#   Flash / SWF (rare but loud when it hits — solvers tried 16+
+#   install attempts on a single Flash Encrypt challenge):
+#     swftools — swfdump / as3compile / abcdump (ActionScript bytecode)
+#
+#   MySQL/MariaDB CLI (web SQL challenges with mysql backends):
+#     mariadb-client — provides the standard `mysql` CLI on Ubuntu
+#     22.04+. pymysql is already installed for Python.
+#
+#   Audio runtime — some game-server jars (paper/Minecraft) init
+#   ALSA on startup even in headless mode:
+#     libasound2 — bare runtime, not the -dev headers.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc-avr binutils-avr avr-libc simavr \
+        mariadb-client \
+        libasound2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && avr-gcc --version | head -1 \
+    && mysql --version
+
+# swftools — apt-installable as of 2025-05-15 but historically gets
+# pulled from jammy/universe periodically (CVE updates, dep churn).
+# Best-effort + we have ffdec (next layer) which covers Flash anyway.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends swftools \
+    && rm -rf /var/lib/apt/lists/* \
+    && (swfdump --help >/dev/null 2>&1 || true) \
+    || echo "swftools install failed (non-fatal — ffdec covers .swf decompilation)"
+
+# JPEXS Free Flash Decompiler — best-in-class .swf decompiler when
+# swftools' abcdump output isn't enough. Pure-Java app; we wire a
+# /usr/local/bin/ffdec shim that runs it via the JDK 21 installed
+# at /opt/jdk-21. Headless CLI mode supports -export script/svg/
+# binarydata so an agent can pipe its output straight into a sed/awk.
+ARG JPEXS_VER=22.0.1
+RUN mkdir -p /opt/jpexs \
+    && curl -fsSL -o /tmp/jpexs.zip \
+        "https://github.com/jindrapetrik/jpexs-decompiler/releases/download/version${JPEXS_VER}/ffdec_${JPEXS_VER}.zip" \
+    && unzip -q /tmp/jpexs.zip -d /opt/jpexs \
+    && rm /tmp/jpexs.zip \
+    && (/opt/jdk-21/bin/java -jar /opt/jpexs/ffdec.jar --help 2>&1 | head -3 || true) \
+    && printf '#!/bin/sh\nexec /opt/jdk-21/bin/java -jar /opt/jpexs/ffdec.jar "$@"\n' > /usr/local/bin/ffdec \
+    && chmod +x /usr/local/bin/ffdec
+
+# Python: ML stack (jax+flax+einops for model-weight challenges),
+# Minecraft protocol libs (mcstatus+quarry for PaperMC / Minecraft
+# CTF challenges), .NET RE bridging (pythonnet — lets Python load
+# .NET assemblies for dnlib-style introspection), and pure-Python
+# SWF parsing (pyswf+pylzma when JPEXS overkill). Late pip layer so
+# adding new libs doesn't bust the heavy upstream installs.
+RUN pip3 install --no-cache-dir \
+        jax flax einops \
+        mcstatus quarry \
+        pythonnet \
+        pyswf pylzma
+
+# ── Tools reference ──────────────────────────────────────────────────────────
+COPY sandbox/sandbox-tools.txt /tools.txt
+
+WORKDIR /challenge

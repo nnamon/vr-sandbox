@@ -1,0 +1,741 @@
+CTF SANDBOX TOOLS REFERENCE
+============================
+All tools pre-installed in the sandbox. cat /tools.txt to view this file.
+
+== FIRST-TURN ORIENTATION ==
+Before forming hypotheses, walk the distfile end-to-end. For every
+file in /challenge/distfiles/:
+  - Run `file <path>` to identify the format (do not infer from extension).
+  - Unpack archives (zip/tar/7z) into /challenge/workspace/ and recurse —
+    Dockerfile / run.sh / Makefile / docker-compose.yml inside a service
+    bundle answer questions about how the remote is actually run.
+  - `cat` any small text artifacts (Dockerfile, run.sh, *.md, *.txt,
+    *.py source) verbatim before reasoning about behaviour.
+
+`uname -m` inside this sandbox reports the SANDBOX's arch, which is the
+docker host's arch (often aarch64 on macOS, x86_64 on Linux). It tells
+you nothing about the challenge target. To determine the target arch,
+read `file <binary>` on the actual challenge binary and any Dockerfile
+in the distfile. For pwn challenges using `pwn.red/jail:<ver>` (visible
+in the Dockerfile), the remote is x86_64; the supplied libc.so.6 +
+ld-linux-*.so.* in the distfile ARE the remote loader and libc — use
+their offsets directly. To exploit-dev under remote-faithful ASLR,
+run the supplied jail under emulation locally:
+  docker run --rm -i --platform linux/amd64 -v $PWD/bin:/srv/app \
+    pwn.red/jail:<ver> sh -lc 'jail /srv/app/run'
+
+== NETWORKING ==
+nc (netcat)        TCP/UDP connections. nc host port <<'EOF' for heredoc sessions.
+curl               HTTP client. -s silent, -k skip TLS, -d data, -H header.
+wget               HTTP download. wget -O file url.
+nmap               Port scanner. nmap -sV host, nmap -p- host.
+masscan            Wide-net port sweeps (faster than nmap for /16+).
+                   masscan 10.0.0.0/8 -p1-65535 --rate 10000.
+ssh / sshpass      OpenSSH client + non-interactive password auth.
+                   sshpass -p guest ssh -o StrictHostKeyChecking=no user@host -p2222.
+dig / nslookup     DNS lookups (dnsutils).
+whois              WHOIS lookups.
+dnsrecon           DNS recon: zone transfers, brute-force, reverse.
+                   dnsrecon -d example.com -t std,axfr.
+onesixtyone        SNMP scanner. onesixtyone -c community.txt 10.0.0.1
+snmpwalk           SNMP walker. snmpwalk -v2c -c public host.
+proxychains4       Pivot through socks/http chain.
+                   proxychains4 -f /etc/proxychains4.conf nmap target.
+chisel-pivot       HTTP-tunneled pivot (jpillora/chisel). On attacker:
+                   chisel-pivot server -p 8080 --reverse.
+                   On target: chisel-pivot client attacker:8080 R:1080:socks.
+mosquitto-clients  MQTT pub/sub. mosquitto_sub -h host -t '#' -v.
+socat              Generic stream forwarder. TLS-SNI tunnel:
+                   socat TCP-LISTEN:3000,fork,reuseaddr \
+                         OPENSSL:host:443,sni=host,verify=0
+                   then `nc localhost 3000` to reach the wrapped TCP target.
+sc (snicat)        CTFd TLS-SNI tunnel helper. sc -b 3000 <sni-host> binds
+                   127.0.0.1:3000 and proxies to the SNI'd backend. Use for
+                   bts.wh.edu.pl-style TLS-wrapped TCP challenges.
+
+== WEB PENTESTING ==
+ffuf               Fast web fuzzer. ffuf -u http://t/FUZZ -w /opt/wordlists/common.txt
+                   Param fuzzing: ffuf -u 'http://t/?FUZZ=x' -w wordlist
+                   VHost: ffuf -u http://t/ -H 'Host: FUZZ.t' -w wordlist -fs 0
+gobuster           Alternative dir buster. gobuster dir -u http://t -w wordlist.
+feroxbuster        Recursive Rust dir buster. feroxbuster -u http://t -w wordlist.
+wfuzz              Versatile fuzzer with payload chaining.
+whatweb            Tech fingerprinting. whatweb http://t.
+nikto              Basic web vuln scanner. nikto -h http://t.
+sqlmap             Automated SQL injection. sqlmap -u 'http://t/?id=1' --batch --dbs
+                   POST: sqlmap -u 'http://t/login' --data 'u=a&p=b' --batch
+nuclei             Template-based vuln scanner. nuclei -u http://t -severity high,critical
+                   First run: nuclei -update-templates (auto-fetches CVE templates).
+mitmproxy          HTTPS interception/replay. mitmproxy --mode reverse:http://t
+                   mitmdump for headless; addons via -s script.py.
+jwt_tool           JWT attacks. jwt_tool <token> -T (tamper), -X k (alg-confusion),
+                   -C -d wordlist (crack HS256 secret), -I -hc kid -hv ../../etc/passwd
+graphql-cop        GraphQL recon (introspection, batching, field suggestions).
+                   graphql-cop -t http://t/graphql
+clairvoyance       GraphQL schema reconstruction when introspection is disabled.
+                   clairvoyance http://t/graphql -o schema.json
+playwright         Headless Chromium + Firefox for browser-driven challenges
+                   (DOM XSS PoCs, prompt-injection forms, OAuth flows, bot
+                   triggers). Firefox clears some anti-bot gates (Cloudflare
+                   managed-challenge) that flag Chromium's fingerprint.
+                   p.chromium.launch() / p.firefox.launch().
+                   python3 -c 'from playwright.sync_api import sync_playwright; ...'
+gau                Historical URL discovery via wayback/CC. gau example.com
+waybackurls        Wayback Machine URL crawler. waybackurls example.com
+/opt/wordlists/    common.txt, raft-medium-{directories,files}.txt, quickhits.txt,
+                   passwords-top10k.txt, passwords-top100k.txt,
+                   rockyou.txt, darkc0de.txt
+                   (some downloads are best-effort; check `ls /opt/wordlists/`).
+
+== DESERIALIZATION GADGETS ==
+ysoserial          Java deserialization payloads. ysoserial CommonsCollections6 'cmd'
+                   Lists chains: ysoserial (no args). Output is raw bytes; pipe to a file.
+ysoserial-net      .NET deserialization payloads. ysoserial-net -g TypeConfuseDelegate \
+                     -f Json.Net -c 'calc.exe'
+                   List gadgets: ysoserial-net --help
+
+== BINARY ANALYSIS ==
+file               Identify file type. file binary
+strings            Extract printable strings. strings -n 8 binary
+xxd                Hex dump. xxd file | head, xxd -r to reverse.
+hexdump            Hex dump. hexdump -C file.
+binwalk            Firmware/embedded extraction. binwalk -e file to extract.
+objdump            Disassembly. objdump -d binary (from binutils-multiarch
+                   so all common targets are supported — `-m i386:x86-64`,
+                   `-m arm`, `-m mips`, etc.). Required for one_gadget on
+                   amd64 from an arm64 host sandbox.
+llvm-objdump       LLVM-based disassembler. Better at exotic archs (RISC-V, ARM
+                   variants, Mach-O). llvm-objdump -d binary,
+                   llvm-objdump --triple=aarch64-linux-gnu -d firmware.
+ld.lld             LLVM linker. Used for kernel-pwn payloads, custom linker
+                   scripts, freestanding builds. `ld.lld -T script.ld -o out a.o`.
+cpio               Initramfs unpack/repack for kernel-pwn:
+                     zcat initramfs.cpio.gz | cpio -idmv          # extract
+                     find . | cpio -o -H newc | gzip > new.cpio.gz # repack
+zig                Zig toolchain at /opt/zig (binary tarball, version 0.14).
+                   `zig cc -target x86_64-linux-musl -static -o exploit exploit.c`
+                   for tiny static binaries; `zig build-exe` for native zig.
+                   Useful for kernel exploits, no-libc shellcode loaders.
+gh                 GitHub CLI. `gh auth login`, `gh pr create`, `gh workflow run`,
+                   `gh api repos/owner/repo/...`. Required for Supply Chain /
+                   GitHub Actions challenges where the model needs to push a
+                   PR or trigger a workflow on an attacker fork.
+ndisasm            Netwide disassembler from NASM. Bare-byte x86 disasm — no
+                   ELF parsing required. ndisasm -b 64 shellcode.bin.
+nasm               Netwide assembler. nasm -f elf64 shell.asm -o shell.o.
+readelf            ELF header info. readelf -a binary.
+nm                 Symbol listing. nm binary.
+upx                UPX unpacker. upx -d packed.exe (works on ELF + PE).
+diec / die         Detect-It-Easy: packer / compiler / protector ID.
+                   diec binary  (CLI; falls back to GUI invocation if missing).
+ghidra-headless    Batch RE via Ghidra's analyzeHeadless. Standard recipe:
+                     mkdir /tmp/proj && \
+                     ghidra-headless /tmp/proj P -import binary \
+                       -postScript ListSymbols.java -overwrite
+                   Also available as `ghidra` and `analyzeHeadless`.
+                   Full Ghidra at /opt/ghidra; GHIDRA_INSTALL_DIR is set so
+                   `pyghidra.start()` boots without configuration. From
+                   Python:
+                     import pyghidra
+                     pyghidra.start()
+                     from ghidra.app.decompiler import DecompInterface
+                     with pyghidra.open_program('binary') as api:
+                         d = DecompInterface(); d.openProgram(api.currentProgram)
+                         res = d.decompileFunction(fn, 60, None)
+                         print(res.getDecompiledFunction().getC())
+redress            Go binary metadata + symbol/type recovery (uses goretk/gore lib).
+                   redress info binary  /  redress source binary
+patchelf           Modify ELF interpreter / RPATH. patchelf --set-interpreter ./ld.so bin
+yara               Pattern matcher (CLI). yara rules.yar target/ -r
+                   Ruleset preloaded at /opt/yara-rules/.
+
+== DECOMPILERS ==
+ghidra / ghidra-headless
+                   See BINARY ANALYSIS. analyzeHeadless ... -postScript Decompile.java.
+                   Also via pyghidra (GHIDRA_INSTALL_DIR is set).
+r2 + r2ghidra +    radare2 with two decompiler plugins loaded.
+r2dec               - r2ghidra (Ghidra-quality C):
+                       r2 ./binary
+                       [0x...]> aaa            (analyse all)
+                       [0x...]> pdg @ main     (decompile via Ghidra)
+                     - r2dec (JS-based pseudo-C):
+                       [0x...]> pdd @ main     (decompile via r2dec)
+                       [0x...]> pdc @ main     (terser pseudo-C)
+                   Try `pdg` first; if output is empty/garbled, switch
+                   to `pdd`. One-shot: r2 -qc 'aaa; pdg @ main' ./binary
+r2pipe (python)    Drive r2 from Python — useful for batch-decompiling
+                   many functions or post-processing output:
+                     import r2pipe; r = r2pipe.open('./binary'); r.cmd('aaa');
+                     out = r.cmd('pdg @ main')
+retdec             Open-source LLVM-based decompiler (amd64 sandboxes only).
+                     retdec-decompiler binary -o out.c
+                   On arm64 sandboxes use ghidra-headless or r2 pdg instead.
+rust-decompile     Rust-specific decompiler (Oxidizer, in angr >=9.2.217).
+                   FAR cleaner than Ghidra/r2 on Rust binaries: recovers enums,
+                   match/if-let, Option/Result, ?-error-propagation, and macros
+                   (println!/format!/panic!). Look for rustc/cargo strings first,
+                   then:
+                     rust-decompile ./binary              (auto-picks functions)
+                     rust-decompile ./binary --functions main 0x4012a0
+                   Use this FIRST on Rust binaries; type DBs cover rustc 1.39-1.93.
+                   (Runs in an isolated py3.12 venv; the main-python `import angr`
+                   stays the C-style symbolic-exec stack.)
+ilspycmd           .NET decompiler. ilspycmd app.dll -o out/   (or -lv 8.0 etc.)
+jadx               Java/APK decompiler (primary). jadx -d out/ app.jar / app.apk
+                   GUI variant available as jadx-gui (X required).
+cfr                Alternative Java decompiler — try when jadx mangles
+                   control flow on obfuscated bytecode.
+                   cfr foo.jar > out.java   (or cfr foo.class)
+fernflower         JetBrains' decompiler — strong on lambdas / streams /
+                   modern Java. fernflower input.jar /outdir/
+                   Output is .java files in <outdir>/<input-basename>/.
+                   (Wraps /opt/jdk-21 since fesh0r's tip needs JDK 21+.)
+procyon            Fourth-fallback Java decompiler — sometimes handles
+                   edge cases (lambdas, switch-on-string) jadx + cfr +
+                   fernflower all mishandle. procyon foo.jar > out.java
+javap              JVM bytecode disassembler. javap -c -p ClassName, javap -v -p Class.
+                   (System default JDK is 11; alternates at /opt/jdk-17,
+                   /opt/jdk-21 for tools/code that need newer language
+                   features. Run as `/opt/jdk-21/bin/javap ...` etc.)
+uncompyle6         Python <=3.8 .pyc decompiler. uncompyle6 file.pyc
+decompyle3         Python 3.7-3.8 .pyc decompiler (alternative).
+pycdc              Python .pyc decompiler that handles 3.10+. pycdc file.pyc
+                   Disassembly: pycdas file.pyc
+pyinstxtractor-ng  Extract a PyInstaller-packed exe back to .pyc + assets.
+                   python3 -m pyinstxtractor app.exe   (output in app.exe_extracted/)
+
+== PWN / EXPLOITATION ==
+pwntools           CTF exploit framework. from pwn import *
+                   p64/p32, ROP, shellcraft, asm, remote()/process().
+gdb                GNU debugger; pwndbg loaded by default at /opt/pwndbg.
+                   Common: gdb ./binary -ex 'b main' -ex r
+                   pwndbg adds: vmmap, telescope, heap, ropper, search.
+gef                Alternative GDB plugin. Switch in: gdb -x /opt/gef.py ./binary
+gdb-multiarch      Cross-arch debugger. Pair with qemu-user-static -g <port>:
+                     qemu-x86_64-static -g 1234 ./binary    (terminal 1)
+                     gdb-multiarch ./binary -ex 'target remote :1234'
+ROPgadget          ROP gadget finder. ROPgadget --binary binary
+ropper             Alternative gadget finder; finds ones ROPgadget misses.
+                   ropper --file binary --search 'pop ?di'
+one_gadget         libc one-shot RCE finder. one_gadget /lib/x86_64-linux-gnu/libc.so.6.
+                   Backed by binutils-multiarch so amd64 libcs work on the
+                   arm64 host sandbox.
+patchelf           Set interpreter / rpath on a target binary so it loads the
+                   challenge-supplied libc. patchelf --set-interpreter ./ld-2.31.so bin
+pwninit            One-shot pwn-challenge prep: detects libc version, downloads
+                   matching ld.so, patches the binary. pwninit (in challenge dir).
+seccomp-tools      Dump SECCOMP filters from a binary (jail/sandbox challenges).
+                   seccomp-tools dump ./binary, seccomp-tools emu policy.txt.
+
+== FUZZING ==
+afl++              Coverage-guided fuzzer. Compile with afl-cc; harness with afl-fuzz.
+                     afl-cc -o target target.c
+                     afl-fuzz -i seeds -o out -- ./target @@
+honggfuzz          Alternative coverage-guided fuzzer.
+                     hfuzz-cc -o target target.c
+                     honggfuzz -i seeds -o out -- ./target ___FILE___
+
+== DEBUGGERS / TRACING ==
+gdb / pwndbg       See PWN / EXPLOITATION.
+ltrace             Library call tracer. ltrace ./binary
+strace             System call tracer. strace ./binary
+                   Cross-arch: strace works under qemu-user-static -strace.
+radare2            Reverse engineering. r2 binary, then aaa; pdf @main; afl
+frida              Dynamic instrumentation (Linux/Wine PEs/Android).
+                   frida-trace -i 'recv*' -p <pid>
+                   frida-ps -U / frida-discover / frida-kill
+                   Python API: import frida; frida.attach(pid)
+
+== STEGANOGRAPHY ==
+steghide           Embed/extract in JPEG/BMP/WAV. steghide extract -sf file.jpg
+stegseek           Brute-force steghide passwords. stegseek file.jpg wordlist.txt
+zsteg              PNG/BMP steg detector. zsteg file.png (tries LSB, bit planes, etc.)
+exiftool           EXIF/metadata reader. exiftool file.jpg
+pngcheck           PNG structure checker. pngcheck -v file.png
+stegoveritas       Automated steg pipeline (runs many tools, dumps results).
+                   stegoveritas file.png
+
+== IMAGE / MEDIA ==
+identify           ImageMagick: identify file properties. identify image.png
+convert            ImageMagick: transform images. convert in.png -enhance out.png
+montage            ImageMagick: tile images. montage *.png out.png
+tesseract          OCR. tesseract image.png stdout, or --psm 6 for block text.
+ffmpeg             Audio/video processing. ffmpeg -i in.wav out.mp3
+sox                Audio analysis. sox in.wav -n spectrogram -o spec.png
+
+== DOCUMENT MALWARE ==
+olevba             Office macro analysis (oletools). olevba doc.docx
+oledump            OLE structure dump. oledump file.doc
+pdfid              PDF object/keyword summary (Didier Stevens). pdfid file.pdf
+pdf-parser         PDF object inspection / extraction. pdf-parser -o N file.pdf
+pdftotext          Extract PDF text. pdftotext file.pdf -
+pdfimages          Extract embedded images. pdfimages file.pdf prefix
+
+== FILESYSTEM FORENSICS ==
+mmls               Sleuthkit: partition layout. mmls disk.img
+fls                Sleuthkit: list files (incl. deleted). fls -r -o offset disk.img
+icat               Sleuthkit: extract file by inode. icat -o offset disk.img inode > out
+tsk_recover        Sleuthkit: recover deleted files. tsk_recover disk.img outdir/
+fsstat             Sleuthkit: filesystem stats. fsstat -o offset disk.img
+foremost           File carving by header/footer. foremost -i disk.img -o outdir/
+testdisk           Partition recovery. testdisk disk.img
+xfs_db             XFS debugger. xfs_db -c "sb 0" -c "p" disk.img
+xfs_repair         XFS repair. xfs_repair -n disk.img (read-only check).
+dcfldd             Forensic dd with hashing. dcfldd if=in of=out hash=md5
+volatility3        Memory forensics. vol -f memdump.raw windows.info
+chntpw             Windows registry editor. chntpw -i SAM (interactive).
+regripper          Windows registry parser with plugins. regripper -r SOFTWARE -p winver
+plaso (psort/log2timeline)
+                   Timeline tooling. log2timeline.py out.plaso disk.img && \
+                     psort.py -o l2tcsv -w timeline.csv out.plaso
+
+== NETWORK FORENSICS ==
+tshark             Wireshark CLI. tshark -r file.pcap -Y 'http.request' -T fields \
+                     -e ip.src -e http.host -e http.request.uri
+                   Decryption (TLS): tshark -r f.pcap -o tls.keylog_file:keys.log
+tcpdump            Packet capture / filter. tcpdump -r file.pcap 'tcp port 80'
+ngrep              grep over packet payloads. ngrep -I file.pcap 'flag{'
+scapy              Python packet crafting/parsing. from scapy.all import *
+                     pkts = rdpcap('f.pcap'); pkts[0].summary()
+
+== CRYPTOGRAPHY ==
+openssl            Crypto swiss army knife. openssl enc, openssl rsa, openssl s_client
+RsaCtfTool         Automated RSA attacks. RsaCtfTool -n N -e E --attack all
+sage               SageMath 10 CAS (conda-forge — has the modern crypto APIs:
+                   EllipticCurve.montgomery_model(), velusqrt isogenies,
+                   sage.rings.generic.ProductTree, GaussianField).
+                   Usage: sage -c 'from sage.all import *; print(factor(n))'
+                   ECM factoring: sage -c 'from sage.all import *; print(ecm.factor(n))'
+                   LLL lattice: sage -c 'M=matrix(ZZ,[...]); print(M.LLL())'
+gp / pari-gp       PARI/GP number-theory CLI (faster than sage for some ops).
+cado-nfs           Number Field Sieve (large factoring/DLP). cado-nfs <N>
+flatter            Fast LLL lattice reduction. flatter < input_matrix
+hashid             Identify hash type. hashid '<hash>'.
+
+== PASSWORD CRACKING ==
+hashcat            GPU/CPU hash cracker. POCL CPU runtime is installed so it
+                   works headlessly without a GPU.
+                     hashcat -m 0   hash.txt /opt/wordlists/rockyou.txt   # MD5
+                     hashcat -m 1000 hash.txt /opt/wordlists/rockyou.txt  # NTLM
+                     hashcat --help | grep -i <algo>                      # find -m
+john               John the Ripper. john --wordlist=/opt/wordlists/rockyou.txt hash.txt
+                   Format autodetect; --format=descrypt etc. for hints.
+hydra              Online password brute-force (SSH/FTP/HTTP/SMB/etc.).
+                   hydra -l user -P /opt/wordlists/rockyou.txt ssh://target.
+ncrack             Alternative online cracker; better for some protocols.
+crunch             Wordlist generator. crunch 4 6 abc123 -o list.txt.
+cewl               Custom wordlist from a webpage. cewl http://t -w site.txt.
+jwt_tool           See WEB PENTESTING — also cracks HS256 secrets.
+
+== ACTIVE DIRECTORY / SMB / WINDOWS ==
+smbclient          Interactive SMB. smbclient -L //host -N (anon list shares).
+enum4linux         SMB/AD enumeration. enum4linux -a host.
+impacket-*         Toolkit. impacket-secretsdump DOMAIN/u:p@host (DCSync),
+                   impacket-psexec / wmiexec / smbexec (post-creds shell),
+                   impacket-GetNPUsers (AS-REP roast),
+                   impacket-GetUserSPNs (Kerberoast),
+                   impacket-ntlmrelayx (relay attacks).
+netexec (cme)      Multi-protocol AD pentest CLI (formerly crackmapexec).
+                   netexec smb host -u user -p pass --shares.
+kerbrute           Kerberos pre-auth user enum + password spray.
+                   kerbrute userenum -d domain users.txt --dc dc.host.
+evil-winrm         PowerShell over WinRM. evil-winrm -i host -u user -p pass.
+responder          LLMNR/NBT-NS/mDNS poisoner.
+                   responder -I eth0 -wd (capture NTLMv2 hashes).
+mitm6              IPv6 DHCP takeover (pairs with ntlmrelayx).
+                   mitm6 -d domain.local.
+pypykatz           Python-only mimikatz alternative (memory-dump credential
+                   extraction). pypykatz lsa minidump dump.dmp.
+gpp-decrypt        Group Policy Preferences password decryption.
+bloodhound-py      AD pathfinding collector (server is heavy; collector is
+                   enough). bloodhound-python -u user -p pass -d domain -c All.
+
+== PRIVESC ENUMERATION ==
+linpeas            Linux privesc enum (/opt/peas/linpeas.sh). bash linpeas.
+winpeas            Windows variants in /opt/peas/winpeas.{exe,bat,ps1}.
+                   Run winpeas.exe on target; results in stdout/colored.
+pspy32 / pspy64    Snoop process/cron without root. /opt/peas/pspy64.
+
+== PIVOTING ==
+chisel-pivot       See NETWORKING (jpillora/chisel). HTTP-tunnel SOCKS.
+proxychains4       See NETWORKING.
+sshpass            See NETWORKING.
+
+== EXPLOIT DATABASE ==
+searchsploit       Offline exploit-db lookup. searchsploit kernel 4.4
+                   (use --update for fresh CVE entries).
+
+== OSINT ==
+theHarvester       Subdomains/emails/hosts from public sources.
+                   theHarvester -d example.com -b all.
+recon-ng           Modular recon framework. recon-ng (interactive); workspaces +
+                   modules — `marketplace install` to add modules.
+sherlock           Username search across social platforms.
+                   sherlock <username>.
+photon             Fast crawler (scrape URLs, JS, secrets).
+                   photon -u http://t -o out.
+subfinder          Passive subdomain enum. subfinder -d example.com.
+httpx              HTTP probe / fingerprint at scale.
+                   subfinder -d example.com | httpx -silent -title.
+gau / waybackurls  See WEB PENTESTING — historical URL discovery.
+
+== WIRELESS ==
+aircrack-ng        WPA/WEP cracking suite.
+                   aircrack-ng handshake.cap -w /opt/wordlists/rockyou.txt.
+                   airodump-ng (capture), aireplay-ng (deauth) — need monitor mode.
+reaver             WPS attack. reaver -i mon0 -b <bssid>.
+
+== CLOUD ==
+aws (awscli)       AWS CLI. aws s3 ls, aws sts get-caller-identity, etc.
+                   Configure via env: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY.
+gcloud             Google Cloud SDK. gcloud auth login, gcloud projects list,
+                   gcloud compute instances list, gsutil ls gs://bucket.
+                   Configure via env GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
+                   or `gcloud auth activate-service-account --key-file sa.json`.
+az (azure-cli)     Azure CLI. az login, az account list, az vm list.
+                   Service principal: az login --service-principal -u <id>
+                   -p <secret> --tenant <tenant>.
+kubectl            Kubernetes CLI. kubectl get pods, kubectl exec -it pod -- sh.
+                   Config via KUBECONFIG=/path/to/config or ~/.kube/config.
+                   For CTF k8s challenges, kubeconfig is usually given.
+cloudfox           Multi-cloud enumeration (BishopFox).
+                   cloudfox aws all-checks --profile default.
+prowler            AWS / Azure / GCP audit framework.
+                   prowler aws --checks ec2_instance_public_ip.
+pacu               AWS exploitation framework (Rhino Security Labs).
+                   Interactive: `pacu` then `set_keys` + `run iam__enum_*`.
+                   Chains IAM privesc primitives. Modules:
+                   `list_modules`, `run aws__enum_account`, etc.
+
+== DESERIALIZATION (continued) ==
+phpggc             PHP gadget-chain generator (PHP analog of ysoserial).
+                   phpggc Laravel/RCE1 'system' 'id'.
+                   List chains: phpggc -l.
+
+== FIRMWARE EXTRACTION ==
+binwalk            See BINARY ANALYSIS.
+sasquatch          Patched unsquashfs that handles non-standard SquashFS
+                   (most IoT firmware uses non-vanilla offsets/algorithms).
+                   sasquatch firmware.bin.
+jefferson          JFFS2 filesystem extractor.
+                   jefferson firmware.jffs2 -d out/.
+ubi_reader         UBI/UBIFS extractor. ubireader_extract_files firmware.ubi.
+
+== LUA REVERSING ==
+unluac             Lua 5.1-5.4 bytecode decompiler. unluac compiled.luac > out.lua.
+
+== AI / LLM SECURITY ==
+art (Python)       Adversarial Robustness Toolbox.
+                   from art.attacks.evasion import FastGradientMethod.
+                   Adversarial examples / model evasion / extraction.
+garak              LLM red-teaming. garak --model_type huggingface --model_name <m>
+                   --probes <probe> — prompt-injection / jailbreak / data-exfil.
+
+== SMART CONTRACTS ==
+forge / cast / anvil / chisel
+                   Foundry toolchain. forge build, forge test, anvil (local RPC),
+                   cast call <addr> <sig>, cast send <addr> <sig> <args>.
+slither            Static analyzer for Solidity. slither contract.sol
+mythril            SMT-based symbolic executor. myth analyze contract.sol
+solc-select        Switch solc versions. solc-select install 0.8.20 && \
+                     solc-select use 0.8.20
+web3 (Python)      from web3 import Web3; w3 = Web3(Web3.HTTPProvider('...'))
+
+== ANDROID ==
+jadx               See DECOMPILERS.
+apktool            APK resource decoder/repackager. apktool d app.apk -o out/
+                   Edit smali/, then apktool b out/ -o new.apk
+aapt               Android Asset Packaging Tool. aapt dump badging app.apk
+                   (manifest summary), aapt dump xmltree app.apk AndroidManifest.xml.
+d2j-dex2jar        Convert .dex/.apk → .jar (then read with jadx/javap).
+                   d2j-dex2jar app.apk -o app.jar
+androguard         Python static-analysis lib.
+                   from androguard.misc import AnalyzeAPK; a, d, dx = AnalyzeAPK('app.apk')
+                   Useful for permission/cert/string mining at scale.
+objection          Frida wrapper for runtime mobile pentesting. Needs a live
+                   Android target — no emulator in this sandbox; objection -g <pkg> explore.
+drozer             Android security assessment framework (also needs a target).
+
+== JVM / JAVA ==
+javac / java       OpenJDK compiler/runtime (default-jdk).
+javap              See DECOMPILERS.
+jar                JAR archive tool. jar tf app.jar, jar xf app.jar.
+keytool            Certificate/keystore tool.
+
+== .NET ==
+dotnet             .NET 8 SDK. dotnet run, dotnet build, dotnet --list-sdks
+                   Run a precompiled .NET binary: dotnet path/to/binary.dll
+ilspycmd           See DECOMPILERS.
+ysoserial-net      See DESERIALIZATION GADGETS.
+
+== BUILD TOOLS / RUNTIMES ==
+gcc / g++          C/C++ compiler (host arch). gcc -o exploit exploit.c
+make / cmake       Build systems.
+mingw-w64          Cross-compile Windows PEs from this Linux sandbox.
+                     x86_64-w64-mingw32-gcc src.c -o out.exe
+                     i686-w64-mingw32-gcc   src.c -o out32.exe
+Foreign-arch Linux cross-compilers (pair with qemu-user-static to run):
+                     aarch64-linux-gnu-gcc       (ARM64 Linux)
+                     arm-linux-gnueabi-gcc       (ARM 32-bit, soft float)
+                     arm-linux-gnueabihf-gcc     (ARM 32-bit, hard float)
+                     mips-linux-gnu-gcc          (MIPS big-endian)
+                     mipsel-linux-gnu-gcc        (MIPS little-endian)
+                     mips64-linux-gnuabi64-gcc   (MIPS64)
+                     riscv64-linux-gnu-gcc       (RISC-V 64-bit)
+                     powerpc-linux-gnu-gcc       (PowerPC)
+                   Build then run: aarch64-linux-gnu-gcc -static src.c -o bin
+                                   qemu-aarch64-static ./bin
+arm-none-eabi-gcc  Bare-metal ARM Cortex-M (firmware, bootloaders).
+                     arm-none-eabi-gcc -mcpu=cortex-m4 -nostartfiles src.c
+go (Go)            Go toolchain at /usr/local/go/bin. go build, go run.
+                   go install <pkg>@latest puts binaries in /root/go/bin/.
+rustc / cargo      Rust toolchain (rustup, stable). cargo new, cargo build --release.
+dotnet             See .NET section.
+mvn (Maven)        Java build automation. mvn package, mvn dependency:tree.
+gradle             Java/Kotlin build automation. gradle build, gradle wrapper.
+php / php-cli      PHP 8 CLI. php -r 'echo phpversion();', php script.php.
+                   Useful for deserialization gadget testing + web challenges.
+composer           PHP dependency manager. composer install, composer require <pkg>.
+jq                 JSON processor. cat file.json | jq '.key'
+nodejs / npm       JavaScript runtime + package manager. node script.js
+sqlite3            SQLite CLI. sqlite3 file.db '.dump'
+rg (ripgrep)       Fast recursive grep, .gitignore-aware. rg pattern path/
+                   rg -t py 'class.*:' src/   (filter by language)
+                   rg -B2 -A5 pattern         (lines of context)
+                   rg --files-with-matches    (list files only, like `grep -l`)
+python / python3   Both names point to Python 3 (python-is-python3 installed).
+                   Python 3.10 is the system base; `python3.12` available via
+                   the uv-managed standalone build at /opt/uv-pythons/.
+
+== SOURCE CODE REVIEW ==
+semgrep            Pattern-based SAST across 30+ languages.
+                   semgrep --config=auto path/                 (sensible defaults)
+                   semgrep --config=p/security-audit path/     (security ruleset)
+                   semgrep --config=p/python path/             (language-specific)
+                   semgrep --config=p/owasp-top-ten path/
+trailmark          Trail of Bits' code-graph analyzer (REQUIRES python3.12).
+                   Polyglot: 20+ languages incl. Solidity/Cairo/Circom.
+                   python3.12 -c '
+                   import trailmark
+                   g = trailmark.Graph.from_directory("./src")
+                   print(g.attack_surface())              # entrypoints + trust
+                   print(g.entrypoint_paths_to("system")) # taint paths
+                   print(g.complexity_hotspots(15))       # high-complexity fns
+                   print(g.functions_that_raise("ValueError"))
+                   '
+                   See https://github.com/trailofbits/trailmark for full API.
+bandit             Python-specific SAST. bandit -r src/
+safety             Python dependency CVE check. safety check
+gosec              Go SAST. gosec ./...
+gitleaks           Secret scanner for git history / files. gitleaks detect -s .
+slither            See SMART CONTRACTS.
+
+== ARCHIVE ==
+zip / unzip        ZIP archives.
+git                Version control / clone repos.
+
+== CONTAINERS (Podman) ==
+podman             Run challenge Docker images inside the sandbox.
+                   podman run -d -p 8080:80 challenge-image
+                   podman build -t myimage .
+podman-compose     Docker Compose compatible. podman-compose up -d
+buildah            Build OCI container images. buildah bud -t myimage .
+
+== PYTHON 3 LIBRARIES ==
+pwntools           CTF exploit framework. from pwn import *
+                   p64/p32 packing, remote/process, ROP, shellcraft, asm.
+pycryptodome       Crypto primitives. from Crypto.Cipher import AES
+sympy              Symbolic math. factorint(n), isprime(n), discrete_log, nthroot_mod.
+gmpy2              Fast multi-precision arithmetic. gmpy2.iroot, gmpy2.invert.
+z3-solver          SMT solver. from z3 import *; s=Solver(); s.add(...); s.check()
+fpylll             LLL/BKZ lattice reduction. from fpylll import IntegerMatrix, LLL.
+angr               Binary analysis framework. import angr; p=angr.Project('bin')
+manticore          Alternative symbolic executor (Trail of Bits).
+                   from manticore.native import Manticore
+triton             Dynamic binary analysis / symbolic execution / taint.
+                   from triton import TritonContext
+capstone           Disassembly engine. from capstone import *
+unicorn            CPU emulator. from unicorn import *
+keystone           Assembler. from keystone import *
+ROPgadget / ropper See PWN.
+ropper (lib)       Programmatic gadget search. from ropper import RopperService
+lief               Cross-format binary parser/modifier. import lief
+pyelftools         ELF parser. from elftools.elf.elffile import ELFFile
+viv-utils          Vivisect helpers used by capa/floss.
+flare-floss        Obfuscated-string deobfuscator. floss binary
+flare-capa         Capability identifier. capa binary
+yara-python        from yara import compile  (yara CLI also installed).
+qiling             Multi-arch/multi-OS emulator (Windows PE on aarch64).
+speakeasy-emulator PE emulator with full Windows API + CNG.
+frida (Python)     Dynamic instrumentation. import frida (CLI also installed).
+scapy              See NETWORK FORENSICS.
+mitmproxy          See WEB PENTESTING (also a Python lib for addons).
+Pillow             Image processing. from PIL import Image
+opencv-python-headless / cv2
+                   Heavier image processing — colour spaces, contours,
+                   bit-plane ops. import cv2; img = cv2.imread('foo.png')
+imageio            Image I/O for unusual formats (TIFF stacks, EXR, GIF
+                   per-frame). import imageio; imageio.imread('foo.gif')
+pypdf / PyPDF2 / pdfplumber / pdfminer.six / fitz (PyMuPDF)
+                   Five overlapping PDF parsers — try in order; coverage
+                   varies by PDF generator. fitz/PyMuPDF is the most
+                   complete (fonts, embedded files, annotations); pdfplumber
+                   is best for table extraction; PyPDF2/pypdf for simple
+                   text + metadata.
+pymysql            MySQL client (pure-Python). import pymysql; pymysql.connect(...)
+pytesseract        Python OCR wrapper. pytesseract.image_to_string(img)
+scipy              Scientific computing. scipy.optimize, scipy.linalg.
+numpy              Numerical arrays. np.frombuffer, np.bitwise_xor.
+requests           HTTP client. requests.get(url), requests.post(url, data=...).
+flask              HTTP server. Quick listeners for callbacks.
+volatility3        Memory forensics framework (Python API).
+torch              PyTorch (CPU). import torch — tensors, neural nets, ML inference.
+keras              Keras deep learning. import keras — model loading, inference.
+PyJWT              JWT encode/decode. import jwt; jwt.encode(payload, key, algorithm='HS256')
+oletools           Office malware analysis. olevba / oleid / msodde / rtfobj
+slither / mythril  Solidity static + symbolic analysis (CLI also installed).
+web3 / eth-abi / eth-utils
+                   Ethereum interaction library suite.
+playwright         Headless browser. async/sync APIs; chromium pre-installed.
+
+== CROSS-ARCH / WINDOWS BINARIES ==
+qemu-*-static      Run foreign-arch Linux ELFs directly. One static binary per
+                   guest arch — pick by name. Examples:
+                     qemu-aarch64-static ./binary   (ARM64 ELF on amd64 host)
+                     qemu-x86_64-static  ./binary   (x86_64 ELF on arm64 host)
+                     qemu-mips64-static  ./binary   (MIPS64, e.g. router fw)
+                     qemu-arm-static     ./binary   (32-bit ARM, e.g. IoT)
+                     qemu-riscv64-static ./binary   (RISC-V)
+                     qemu-i386-static    ./binary   (32-bit x86)
+                   The `-static` suffix is optional — `qemu-i386 ./binary`,
+                   `qemu-arm ./binary`, etc. are aliased to the static
+                   variants for ergonomic invocation.
+                   i386 sysroot: /opt/i386-sysroot is populated with
+                   libc6:i386 + libstdc++6:i386 etc., and QEMU_LD_PREFIX
+                   points there. Dynamically-linked 32-bit x86 ELFs (most
+                   pwnable.tw / picoCTF / wargame binaries) Just Work via
+                   `qemu-i386-static ./binary` with no -L flag needed. The
+                   challenge-shipped libc.so.6 (when present in distfiles)
+                   takes precedence; for ROP / one_gadget, use that one.
+                   x86_64 sysroot: /opt/x86_64-sysroot mirrors the same
+                   pattern for 64-bit x86 ELFs on the arm64 sandbox.
+                   /lib64/ld-linux-x86-64.so.2 is symlinked into place,
+                   so `./binary` (binfmt) and `qemu-x86_64-static ./binary`
+                   both resolve their interpreter without -L flags.
+                   Cross-arch GDB: `qemu-x86_64-static -g 1234 ./binary`,
+                   then in another shell: `gdb-multiarch ./binary`,
+                   `target remote :1234`. Strace works the same way.
+                   binfmt_misc may also auto-dispatch ./binary directly when
+                   the host kernel has handlers registered (Docker Desktop
+                   normally does); explicit qemu-*-static is the fallback.
+                   Multi-version GLIBC: when a binary requires a libc the
+                   default sysroot doesn't have (`version GLIBC_2.X not
+                   found`), use one of the pre-extracted versions under
+                   /opt/glibc/<ver>/ (2.23, 2.27, 2.31, 2.35, 2.39).
+                   Convenience wrapper:
+                     glibc-run                     # list versions
+                     glibc-run 2.27 ./vuln         # run with glibc 2.27
+                     glibc-run 2.39 ./vuln arg1
+                   Match the version to the binary's stated requirement
+                   (`strings binary | grep GLIBC_` or check the libc
+                   shipped alongside it). Per-challenge libcs from
+                   distfiles still take precedence — only reach for
+                   /opt/glibc/ when the challenge didn't bundle one.
+wine / wine64      Run Windows PE binaries. wine64 file.exe (x86_64 PE),
+                   wine file.exe (32-bit PE; available on amd64 sandboxes).
+                   Pre-initialised Wine prefix at /opt/wineprefix.
+                   Headless: WINEDEBUG=-all wine64 file.exe (already default).
+                   On an arm64 sandbox, wine handles ARM PEs natively; x64
+                   PE execution under Wine on arm64 needs box64/FEX (not
+                   installed) — for those, prefer static analysis (Ghidra,
+                   capa, floss) or rebuild the sandbox with --platform
+                   linux/amd64.
+
+== CALLBACK / TUNNELS ==
+For SSRF, blind XSS, OAuth callbacks, reverse shells, OOB exfil, etc.
+Two scenarios:
+
+  1. Target is on our VPN or shares a docker network -> bind a listener
+     on tun0/eth0 directly; use the interface IP as the callback URL.
+     `expose-port <port>` prints the right address.
+
+  2. Target is on the public internet -> tunnel the local listener out.
+     None of these need an account or API key.
+
+expose-port        Helper. `expose-port <port>` prints reachable VPN/docker
+                   addresses for <port> plus copy-paste tunnel commands.
+                   Does not spawn anything itself.
+cloudflared        HTTP(S) tunnel to *.trycloudflare.com, no auth.
+                   `cloudflared tunnel --url http://localhost:8080 --no-autoupdate`
+                   public URL appears on stderr. Ephemeral; dies with process.
+                   Full request/response — serve any payload from the local server.
+bore               Raw TCP forward to bore.pub:RANDOM, no auth.
+                   `bore local 4444 --to bore.pub`
+                   Use for reverse shells, custom protocol servers, anything TCP.
+                   remote_port is logged on stderr.
+pinggy             SSH-based tunnel; no install — uses the system ssh.
+                   60-min sessions on the free tier (anonymous).
+                   HTTP/HTTPS:
+                     `ssh -p 443 -o StrictHostKeyChecking=no -R0:localhost:8080 a.pinggy.io`
+                   TCP (use for reverse shells, custom protocol servers):
+                     `ssh -p 443 -o StrictHostKeyChecking=no -R0:localhost:4444 tcp@a.pinggy.io`
+                   The assigned public URL (https://<rand>.free.pinggy.link
+                   or tcp://<host>:<port>) is printed on the ssh banner —
+                   tee stdout/stderr to a file and grep for `.pinggy.`.
+                   Useful when cloudflared is rate-limited or bore.pub
+                   is blocked; survives where one of the others doesn't.
+interactsh-client  Out-of-band capture for DNS / HTTP / SMTP / LDAP, no auth.
+                   `interactsh-client -v` prints a *.oast.* hostname; any hit
+                   on it is logged. Capture-only — cannot serve dynamic
+                   responses (use cloudflared for that). Public OAST servers
+                   run by Project Discovery (oast.pro/site/live/...).
+
+== EMBEDDED / MICROCONTROLLER ==
+avr-gcc            AVR C compiler. avr-gcc -mmcu=atmega328p -o out.elf src.c.
+avr-as             AVR assembler.
+avr-ld             AVR linker.
+avr-objdump        AVR disassembler. avr-objdump -d firmware.hex (Intel HEX too).
+avr-objcopy        Convert between formats (ELF ↔ ihex ↔ binary).
+avr-size           Section size summary.
+simavr             AVR ATmega/ATtiny emulator. simavr -m atmega328p firmware.elf.
+
+== FLASH / SWF ==
+swfdump            Dump SWF structure + ActionScript bytecode (from swftools).
+abcdump            Adobe ABC (ActionScript bytecode) disassembler.
+as3compile         Compile ActionScript 3 → SWF.
+ffdec              JPEXS Free Flash Decompiler (JPEXS) — best decompilation
+                   quality for AS1/2/3. Headless: `ffdec -export script out/ in.swf`.
+
+== DATABASE CLIENTS ==
+mysql              MariaDB/MySQL CLI. `mysql -h HOST -P PORT -u USER -p`.
+pymysql            Python lib (pre-installed). `import pymysql`.
+
+== ML / AI ==
+ML stack pre-installed: jax, flax, einops, numpy, scipy.
+Use for memorization-extraction style challenges (find a prompt prefix
+that makes greedy decode emit the flag).
+
+== MINECRAFT / GAME PROTOCOLS ==
+mcstatus           Probe Minecraft server status. `mcstatus HOST status`.
+quarry             Python Minecraft protocol lib. `import quarry`.
+
+== NOTES ==
+- The sandbox can execute foreign-arch Linux ELFs via qemu-*-static and
+  Windows PEs via wine/wine64 — see the section above for invocation.
+  Static analysis (Ghidra, radare2, capa, floss, angr) remains the right
+  starting point for non-trivial RE; dynamic analysis is a complement.
+- Need a package not listed? Run `pip install <pkg>` or `uv pip install <pkg>`.
+- Distfiles are at /challenge/distfiles/ (read-only)
+- Write generated/repaired files to /challenge/workspace/ (writable)
+- Services on the host are reachable via host.docker.internal (bridge networking).
+- RsaCtfTool is at /opt/RsaCtfTool/
+- CADO-NFS is at /opt/cado-nfs/
+- Ghidra is at /opt/ghidra/  (use ghidra / ghidra-headless / analyzeHeadless
+  for batch jobs; pyghidra works out of the box — GHIDRA_INSTALL_DIR is set)
+- i386 sysroot at /opt/i386-sysroot/  (32-bit ELFs Just Work via qemu-i386)
+- x86_64 sysroot at /opt/x86_64-sysroot/  (64-bit x86 ELFs Just Work on arm64 sandbox)
+- Multi-version GLIBC at /opt/glibc/{2.23,2.27,2.31,2.35,2.39}/  (use `glibc-run <ver> ./binary`)
+- pwndbg is at /opt/pwndbg/, gef.py at /opt/gef.py
+- YARA rules at /opt/yara-rules/, jwt_tool at /opt/jwt_tool/
+- ysoserial.jar at /opt/ysoserial.jar, ysoserial-net at /opt/ysoserial-net/
+- Didier Stevens suite at /opt/dss/, RegRipper3 at /opt/regripper/

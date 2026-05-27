@@ -1,0 +1,25 @@
+# Thin OpenVPN sidecar image — pairs with vr-sandbox for any workflow
+# that needs to attach the sandbox to a VPN tunnel (e.g. HTB Machines,
+# corporate VPN-gated targets, lab networks). Consumers run this with
+# `--cap-add NET_ADMIN --device /dev/net/tun --config /vpn.ovpn`, then
+# attach worker containers via `--network container:<this>`.
+#
+# Originally written for ctf-agent's HtbMachinesBackend; reusable for
+# anything that needs a same-pod OpenVPN endpoint.
+#
+# Alpine base because we want this small (~12 MB compressed). The only
+# requirements are openvpn itself and iproute2 for the readiness probe
+# (`ip addr show tun0` to confirm the tunnel came up).
+
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    openvpn \
+    iproute2 \
+    ca-certificates
+
+# openvpn drops privileges by default which is fine for a sidecar; the
+# CMD is set by the caller (HtbMachinesBackend passes the full openvpn
+# invocation including --config /vpn.ovpn).
+ENTRYPOINT []
+CMD ["openvpn", "--version"]
