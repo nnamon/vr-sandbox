@@ -12,6 +12,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -259,9 +260,15 @@ jobs:
       - name: Create manifest list and push (${{ matrix.image }})
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create \
-            -t ${{ matrix.image_ref }}:latest \
-            -t ${{ matrix.image_ref }}:${{ github.sha }} \
+          # Branch + workflow_dispatch builds tag :latest + :<sha>.
+          # Tag pushes (refs/tags/v*) additionally tag :<tag> so a
+          # GitHub release like v1.0.0 lands as nnamon/<img>:v1.0.0
+          # on Docker Hub.
+          TAGS="-t ${{ matrix.image_ref }}:latest -t ${{ matrix.image_ref }}:${{ github.sha }}"
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            TAGS="$TAGS -t ${{ matrix.image_ref }}:${GITHUB_REF#refs/tags/}"
+          fi
+          docker buildx imagetools create $TAGS \
             $(printf '${{ matrix.image_ref }}@sha256:%s ' *)
 
       - name: Inspect resulting image (${{ matrix.image }})
