@@ -25,7 +25,14 @@ jobs:
   # runner so the build is CPU-bound, not QEMU-bound. vr-vpn is the
   # thin alpine+openvpn sidecar; tiny enough (~12 MB) that the extra
   # build time is negligible alongside vr-sandbox.
+  #
+  # Tag pushes (refs/tags/v*) SKIP the build matrix entirely and go
+  # straight to the `retag` job below — the matching :<sha> manifest
+  # was already published by the main-branch build for that commit,
+  # so the tag just needs a manifest-list copy on Docker Hub
+  # (~10 seconds vs ~1.5h for a fresh multi-arch build).
   build:
+    if: github.ref_type != 'tag'
     strategy:
       fail-fast: false
       matrix:
@@ -260,16 +267,62 @@ jobs:
       - name: Create manifest list and push (${{ matrix.image }})
         working-directory: /tmp/digests
         run: |
-          # Branch + workflow_dispatch builds tag :latest + :<sha>.
-          # Tag pushes (refs/tags/v*) additionally tag :<tag> so a
-          # GitHub release like v1.0.0 lands as nnamon/<img>:v1.0.0
-          # on Docker Hub.
-          TAGS="-t ${{ matrix.image_ref }}:latest -t ${{ matrix.image_ref }}:${{ github.sha }}"
-          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
-            TAGS="$TAGS -t ${{ matrix.image_ref }}:${GITHUB_REF#refs/tags/}"
-          fi
-          docker buildx imagetools create $TAGS \
+          docker buildx imagetools create \
+            -t ${{ matrix.image_ref }}:latest \
+            -t ${{ matrix.image_ref }}:${{ github.sha }} \
             $(printf '${{ matrix.image_ref }}@sha256:%s ' *)
 
       - name: Inspect resulting image (${{ matrix.image }})
         run: docker buildx imagetools inspect ${{ matrix.image_ref }}:latest
+
+  # Retag-only path for tag pushes — no rebuild. Composes a fresh
+  # manifest list pointing at the same per-arch digests that
+  # nnamon/<image>:<sha> already references, then publishes it under
+  # the tag name. Takes ~10s instead of the ~1.5h a fresh multi-arch
+  # build needs.
+  #
+  # Assumption: the tagged commit was already built on main (or via
+  # workflow_dispatch) before the tag was pushed. If :<sha> doesn't
+  # exist yet on Docker Hub, this poll-loops for up to 15min waiting
+  # for the build to publish — covers the "git push main && git push
+  # --tags" case where both events fire near-simultaneously.
+  retag:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image_ref: [nnamon/vr-sandbox, nnamon/vr-vpn]
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Wait for ${{ matrix.image_ref }}:${{ github.sha }} to be published
+        run: |
+          # The main-branch build for this commit may still be in flight
+          # if main + tag were pushed together. Poll for up to 15min.
+          SRC="${{ matrix.image_ref }}:${{ github.sha }}"
+          for i in $(seq 1 90); do
+            if docker buildx imagetools inspect "$SRC" >/dev/null 2>&1; then
+              echo "found $SRC after ${i}x10s"
+              exit 0
+            fi
+            echo "  waiting for $SRC (attempt $i/90)..."
+            sleep 10
+          done
+          echo "ERROR: $SRC never appeared. Push tag again after main build completes."
+          exit 1
+
+      - name: Retag as :${{ github.ref_name }}
+        run: |
+          docker buildx imagetools create \
+            -t ${{ matrix.image_ref }}:${{ github.ref_name }} \
+            ${{ matrix.image_ref }}:${{ github.sha }}
+
+      - name: Inspect resulting tag
+        run: docker buildx imagetools inspect ${{ matrix.image_ref }}:${{ github.ref_name }}
