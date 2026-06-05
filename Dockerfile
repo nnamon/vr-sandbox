@@ -1204,6 +1204,19 @@ RUN dpkg --add-architecture amd64 \
     # loader so /lib64/ld-linux-x86-64.so.2 resolves to a real ELF.
     && ln -sf /opt/x86_64-sysroot/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /opt/x86_64-sysroot/lib64/ld-linux-x86-64.so.2 \
     && ln -sf /opt/x86_64-sysroot/lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2 \
+    # Fixing the loader alone is not enough: the loader's DEFAULT search path
+    # is /lib/x86_64-linux-gnu + /usr/lib/x86_64-linux-gnu, neither of which
+    # exists on the arm64 base, so a bare-exec of an x86_64 ELF (via binfmt
+    # qemu) starts the loader but then dies with "libc.so.6: cannot open shared
+    # object file". Put the sysroot's x86_64 runtime on that path so `./binary`
+    # and `qemu-x86_64-static ./binary` resolve libc without an explicit
+    # `-L /opt/x86_64-sysroot`. usrmerge (/lib -> usr/lib) means the single
+    # /usr/lib link also satisfies the /lib/x86_64-linux-gnu search entry.
+    # Guarded by the libc.so.6 check so a native linux/amd64 build (where the
+    # dir already holds the HOST libc) is left untouched — only arm64 builds,
+    # which have no native x86_64 dir, get the additive symlink.
+    && { [ -e /usr/lib/x86_64-linux-gnu/libc.so.6 ] \
+         || ln -sfn /opt/x86_64-sysroot/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; } \
     # Same cleanup as the i386 block above — drop the foreign-arch
     # source.list entry and dearchitecture so later `apt-get update`
     # invocations don't 404 on ports.ubuntu.com. On native amd64

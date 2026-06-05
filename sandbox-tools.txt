@@ -623,10 +623,18 @@ qemu-*-static      Run foreign-arch Linux ELFs directly. One static binary per
                    challenge-shipped libc.so.6 (when present in distfiles)
                    takes precedence; for ROP / one_gadget, use that one.
                    x86_64 sysroot: /opt/x86_64-sysroot mirrors the same
-                   pattern for 64-bit x86 ELFs on the arm64 sandbox.
-                   /lib64/ld-linux-x86-64.so.2 is symlinked into place,
-                   so `./binary` (binfmt) and `qemu-x86_64-static ./binary`
-                   both resolve their interpreter without -L flags.
+                   pattern for 64-bit x86 ELFs on the arm64 sandbox. Both
+                   the loader (/lib64/ld-linux-x86-64.so.2) and the x86_64
+                   libc are on the default search path, so `./binary`
+                   (binfmt) and `qemu-x86_64-static ./binary` Just Work with
+                   no -L flag. If a bare run ever fails to find the loader or
+                   `libc.so.6` (older sandbox image, or you want a specific
+                   runtime), the always-reliable form is:
+                     qemu-x86_64-static -L /opt/x86_64-sysroot ./binary
+                   The x86_64 runtime lives under /opt/x86_64-sysroot and the
+                   per-version glibc trees under /opt/glibc/<ver>/ — a plain
+                   `find /lib /usr` will NOT show it, so don't conclude
+                   "no x86_64 loader" from an empty search there.
                    Cross-arch GDB: `qemu-x86_64-static -g 1234 ./binary`,
                    then in another shell: `gdb-multiarch ./binary`,
                    `target remote :1234`. Strace works the same way.
