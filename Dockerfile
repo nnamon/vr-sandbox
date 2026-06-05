@@ -1196,6 +1196,13 @@ RUN dpkg --add-architecture amd64 \
     && cd / \
     && rm -rf /tmp/amd64-debs /var/lib/apt/lists/* \
     && mkdir -p /lib64 \
+    # The amd64 libc6 deb ships lib64/ld-linux-x86-64.so.2 as an ABSOLUTE
+    # symlink to /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 — a HOST path that
+    # is absent on the arm64 base, so the chain dangles and qemu-x86_64 can't
+    # load the interpreter for ANY x86_64 binary ("Could not open
+    # '/lib64/ld-linux-x86-64.so.2'"). Repoint it at the sysroot's OWN real
+    # loader so /lib64/ld-linux-x86-64.so.2 resolves to a real ELF.
+    && ln -sf /opt/x86_64-sysroot/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /opt/x86_64-sysroot/lib64/ld-linux-x86-64.so.2 \
     && ln -sf /opt/x86_64-sysroot/lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2 \
     # Same cleanup as the i386 block above — drop the foreign-arch
     # source.list entry and dearchitecture so later `apt-get update`
