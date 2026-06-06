@@ -71,8 +71,7 @@ RUN apt-get update && apt-get install -y \
     ruby ruby-dev \
     # Java (full JDK for jar/javap/javac, also Ghidra headless)
     default-jdk-headless \
-    # JS runtime (web challenges, audit of JS source)
-    nodejs npm \
+    # JS runtime installed from NodeSource below (jammy apt ships EOL Node 12).
     # Web pentesting
     sqlmap \
     # SQLite (DB forensics, practice)
@@ -109,6 +108,18 @@ RUN apt-get update && apt-get install -y \
     # Build deps for r2dec (r2pm-installed below) — meson + ninja.
     ninja-build meson \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Node.js 22 LTS (NodeSource) ───────────────────────────────────────────────
+# Ubuntu jammy's apt `nodejs` is frozen at 12.22.9 (EOL April 2022) — too old
+# for modern JS challenge tooling and source audits. Install the current LTS
+# (22.x) from NodeSource, whose package bundles a matching npm. The setup
+# script pulls its own ca-certificates/curl/gnupg prereqs (curl + CA certs are
+# already present from the apt block above). Multi-arch (amd64 + arm64). The
+# version echo doubles as a build-time smoke check.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version && npm --version
 
 # ── SageMath 10 (via micromamba + conda-forge) ────────────────────────────────
 # Ubuntu apt only ships SageMath 9.5 (Jan 2022) on both 22.04 jammy and
